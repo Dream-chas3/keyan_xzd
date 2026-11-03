@@ -1,0 +1,14 @@
+<launch>
+
+    <!-- 飞行模式默认 require_offboard=true：只有 OFFBOARD + SWA 中档才分配 ID。
+         地面台架看 ID（POSCTL + SWA 中档）时这样启动：
+           roslaunch yoloUltra_test Safina_yoloUltra_test.launch require_offboard:=false
+         台架模式仍然没有任何飞控输出。 -->
+    <arg name="require_offboard" default="true"/>
+
+    <node pkg="yoloUltra_test" type="Safina_yoloUltra_test" name="Safina_yoloUltra_test" output="screen">
+        <rosparam file="$(find yoloUltra_test)/config/yolo_track.yaml" command="load"/>
+        <param name="tracker/require_offboard" value="$(arg require_offboard)"/>
+    </node>
+
+</launch>

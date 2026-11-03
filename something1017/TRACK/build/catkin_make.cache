@@ -1,0 +1,2 @@
+track_test:yoloUltra_test
+-DCATKIN_DEVEL_PREFIX=/home/orangepi/something1017/TRACK/devel -DCMAKE_INSTALL_PREFIX=/home/orangepi/something1017/TRACK/install -G Unix Makefiles

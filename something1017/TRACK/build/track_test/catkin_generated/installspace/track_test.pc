@@ -1,0 +1,8 @@
+prefix=/home/orangepi/something1017/TRACK/install
+
+Name: track_test
+Description: Description of track_test
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

@@ -1,0 +1,763 @@
+#ifndef LAND_TEST_LANDING_TASK_H
+#define LAND_TEST_LANDING_TASK_H
+
+#include "land_test/motion_limits.h"
+#include <cmath>
+#include <limits>
+#include <string>
+
+// Pure control policy: no ROS, sockets, mode services or arming side effects.
+namespace land_task {
+constexpr double kPi = 3.14159265358979323846;
+inline double angle(double value) { return std::atan2(std::sin(value), std::cos(value)); }
+inline double clamp(double value, double limit) { return std::max(-limit, std::min(limit, value)); }
+
+struct Config {
+    bool auto_takeoff = false;
+    bool align_yaw = true;
+    double takeoff_altitude = 1.2;
+    double takeoff_speed = 0.25;
+    double takeoff_kp = 0.8;
+    double hover_seconds = 2.0;
+    // Coarse takeoff completion is separate from precision-landing stability.
+    double takeoff_xy_tolerance = 0.15;
+    double takeoff_z_tolerance = 0.08;
+    double takeoff_stable_xy_speed = 0.10;
+    double takeoff_stable_z_speed = 0.10;
+    double takeoff_stable_yaw_rate = 0.10;
+    double xy_kp = 0.4;
+    double xy_kd = 0.0;   // measured horizontal velocity damping, seconds
+    double xy_ki = 0.0;   // integral gain, (m/s) per (m*s); 0 disables
+    double xy_integral_limit = 0.05;  // m/s cap on the horizontal I contribution
+    double z_kp = 0.8;
+    double z_kd = 0.0;    // measured vertical velocity damping, seconds
+    double z_ki = 0.0;    // integral gain for altitude hold; 0 disables
+    double z_integral_limit = 0.05;   // m/s cap on the vertical I contribution
+    double yaw_kp = 0.35;
+    double descent_speed = 0.08;
+    double max_xy_speed = 0.15;
+    double max_z_speed = 0.25;
+    double max_yaw_rate = 0.10;
+    // Gentle heading correction during descent. It never gates DESCEND and is
+    // independent of the strict align_yaw/ROTATE logic.
+    bool soft_yaw_enabled = false;
+    bool soft_yaw_to_top_edge = false;  // true: nose parallel to the top/bottom edge pair,
+                                        // false: nearest of the four edges
+    double soft_yaw_kp = 0.3;
+    double soft_yaw_max_rate = 0.06;   // rad/s
+    double soft_yaw_deadband = 0.05;   // rad, about 2.9 deg
+    // Start the edge alignment as soon as the target is confirmed (TRANSLATE),
+    // instead of waiting for DESCEND.
+    bool soft_yaw_approach = false;
+    double yaw_hold_speed = 0.06;
+    double yaw_hold_kp = 0.6;
+    double max_xy_accel = 0.25;
+    double max_z_accel = 0.30;
+    double max_yaw_accel = 0.12;
+    double yaw_start_error = 0.10;
+    double yaw_exit_error = 0.15;
+    double align_enter_error = 0.07;
+    double align_exit_error = 0.12;
+    double yaw_tolerance = 5.0*kPi/180.0;
+    double yaw_exit_tolerance = 9.0*kPi/180.0;
+    double stable_seconds = 1.0;
+    double stable_xy_speed = 0.06;
+    double stable_z_speed = 0.06;
+    double stable_yaw_rate = 0.03;
+    double target_confirm_seconds = 0.25;
+    double target_timeout = 0.4;
+    double initial_target_timeout = 8.0;
+    bool short_loss_enabled = true;
+    double short_loss_seconds = 0.6;
+    double short_loss_speed = 0.05;
+    double short_loss_max_travel = 0.03;
+    double reacquire_seconds = 0.10;
+    double final_marker_distance = 0.25;
+    double final_confirm_seconds = 0.3;
+    // Terminal descent: once the marker is close (large in the image) and
+    // centered, stop chasing new observations and descend on the frozen world
+    // target. Loss of the marker no longer pauses this bounded final descent.
+    bool terminal_descent_enabled = true;
+    double terminal_marker_depth = 0.85;   // optical depth, not AGL
+    double terminal_height = 0.80;         // local Z below which a centered marker commits
+    double terminal_land_height = 0.15;    // local Z below which terminal descent hands off to AUTO.LAND
+    double terminal_hold_kp = 0.8;         // gentle position hold gain in the last phase
+    double terminal_hold_kd = 0.5;         // measured-velocity damping for the terminal hold
+    double terminal_hold_speed = 0.08;     // m/s, max hold correction (zero velocity drifted ~20 cm)
+    // After the close-range hover the camera-to-body offset is corrected at
+    // constant altitude, then the aircraft descends blind on the frozen target.
+    double terminal_align_error = 0.05;    // m, offset-correction tolerance before descending
+    double terminal_align_confirm_seconds = 0.2;
+    double terminal_align_timeout = 6.0;   // s, descend anyway if the correction cannot settle
+    // Freeze the aligned heading at the terminal commit and hold it through the
+    // blind descent. The marker is not used after the commit.
+    bool terminal_heading_hold = true;
+    double terminal_heading_kp = 0.5;
+    double terminal_heading_max_rate = 0.06;   // rad/s
+    double terminal_center_error = 0.10;   // m
+    double terminal_descent_speed = 0.12;  // m/s
+    double terminal_max_descent = 1.0;     // m below entry
+    double terminal_timeout = 20.0;        // s
+    double terminal_max_drift = 0.25;      // m from the frozen target
+    double terminal_confirm_seconds = 0.2;
+    // If the marker disappears while already descending in this band, commit
+    // to the last accepted target instead of hovering.
+    double terminal_loss_depth = 1.20;     // optical depth, not AGL
+    double terminal_loss_error = 0.15;     // m
+    double near_ground_loss_seconds = 0.6;
+    double prestream_seconds = 1.2;
+    double takeover_timeout = 10.0;
+    double handoff_timeout = 10.0;
+    double retry_seconds = 1.0;
+    double max_tick_gap = 0.25;
+
+    bool valid(std::string& reason) const {
+        for (double v : {takeoff_altitude,takeoff_speed,takeoff_kp,hover_seconds,
+                         takeoff_xy_tolerance,takeoff_z_tolerance,takeoff_stable_xy_speed,
+                         takeoff_stable_z_speed,takeoff_stable_yaw_rate,xy_kp,z_kp,yaw_kp,
+                         xy_integral_limit,z_integral_limit,
+                         descent_speed,max_xy_speed,max_z_speed,max_yaw_rate,yaw_hold_speed,yaw_hold_kp,max_xy_accel,max_z_accel,
+                         max_yaw_accel,yaw_start_error,yaw_exit_error,align_enter_error,align_exit_error,
+                         yaw_tolerance,yaw_exit_tolerance,stable_seconds,stable_xy_speed,stable_z_speed,
+                         stable_yaw_rate,target_confirm_seconds,target_timeout,initial_target_timeout,
+                         short_loss_seconds,short_loss_speed,short_loss_max_travel,reacquire_seconds,
+                         final_marker_distance,final_confirm_seconds,near_ground_loss_seconds,
+                         terminal_marker_depth,terminal_height,
+                         terminal_hold_kp,terminal_hold_speed,terminal_land_height,
+                         terminal_align_error,terminal_align_confirm_seconds,terminal_align_timeout,
+                         terminal_heading_kp,terminal_heading_max_rate,
+                         soft_yaw_kp,soft_yaw_max_rate,
+                         terminal_center_error,terminal_descent_speed,
+                         terminal_max_descent,terminal_timeout,terminal_max_drift,terminal_confirm_seconds,
+                         terminal_loss_depth,terminal_loss_error,
+                         prestream_seconds,takeover_timeout,handoff_timeout,retry_seconds,max_tick_gap}) {
+            if (!std::isfinite(v) || v <= 0) { reason="nonpositive_or_nonfinite_parameter"; return false; }
+        }
+        if(xy_kd<0.0||z_kd<0.0||terminal_hold_kd<0.0||!std::isfinite(xy_kd)||!std::isfinite(z_kd)||
+           !std::isfinite(terminal_hold_kd)) {
+            reason="negative_or_nonfinite_velocity_damping"; return false;
+        }
+        if(xy_ki<0.0||z_ki<0.0||!std::isfinite(xy_ki)||!std::isfinite(z_ki)) {
+            reason="negative_or_nonfinite_integral_gain"; return false;
+        }
+        if(!std::isfinite(soft_yaw_deadband)||soft_yaw_deadband<0||soft_yaw_max_rate>max_yaw_rate) {
+            reason="invalid_soft_yaw_limits"; return false;
+        }
+        if (align_enter_error >= align_exit_error || yaw_start_error >= yaw_exit_error ||
+            yaw_tolerance >= yaw_exit_tolerance || prestream_seconds < 1.0 ||
+            takeover_timeout <= prestream_seconds || descent_speed > max_z_speed ||
+            takeoff_speed > max_z_speed || max_tick_gap >= target_timeout) {
+            reason="inconsistent_thresholds_or_limits"; return false;
+        }
+        if(terminal_descent_speed>max_z_speed||terminal_max_drift<=terminal_center_error||
+           terminal_loss_depth<terminal_marker_depth) {
+            reason="invalid_terminal_descent_limits"; return false;
+        }
+        if(terminal_hold_speed>max_xy_speed) {
+            reason="invalid_terminal_hold_limits"; return false;
+        }
+        if(terminal_align_error>=terminal_center_error||terminal_align_error>=terminal_max_drift) {
+            reason="invalid_terminal_align_limits"; return false;
+        }
+        if(terminal_heading_max_rate>max_yaw_rate) {
+            reason="invalid_terminal_heading_limits"; return false;
+        }
+        if(terminal_land_height>=terminal_height) {
+            reason="invalid_terminal_land_height"; return false;
+        }
+        if(yaw_hold_speed>0.08||yaw_hold_speed>max_xy_speed){reason="invalid_yaw_hold_speed";return false;}
+        if(short_loss_seconds>1.0||short_loss_speed>max_xy_speed||short_loss_max_travel>0.1||reacquire_seconds>=short_loss_seconds) {
+            reason="invalid_short_loss_limits";return false;
+        }
+        return true;
+    }
+};
+
+enum class Phase { IDLE, PRESTREAM, TAKEOFF, ACQUIRE, TRANSLATE, ROTATE,
+                   BRAKE_TURN, STABILIZE, DESCEND, TERMINAL_ALIGN, TERMINAL_DESCEND, SHORT_LOSS, LOST_HOLD,
+                   LAND_HANDOFF, AUTO_LAND, COMPLETE, CANCELLED };
+inline const char* name(Phase p) {
+    switch (p) {
+    case Phase::IDLE:return "IDLE"; case Phase::PRESTREAM:return "PRESTREAM";
+    case Phase::TAKEOFF:return "TAKEOFF"; case Phase::ACQUIRE:return "ACQUIRE";
+    case Phase::TRANSLATE:return "TRANSLATE"; case Phase::ROTATE:return "ROTATE";
+    case Phase::BRAKE_TURN:return "BRAKE_TURN"; case Phase::STABILIZE:return "STABILIZE";
+    case Phase::DESCEND:return "DESCEND"; case Phase::TERMINAL_ALIGN:return "TERMINAL_ALIGN";
+    case Phase::TERMINAL_DESCEND:return "TERMINAL_DESCEND";
+    case Phase::SHORT_LOSS:return "SHORT_LOSS";
+    case Phase::LOST_HOLD:return "LOST_HOLD";
+    case Phase::LAND_HANDOFF:return "LAND_HANDOFF"; case Phase::AUTO_LAND:return "AUTO_LAND";
+    case Phase::COMPLETE:return "COMPLETE"; case Phase::CANCELLED:return "CANCELLED";
+    }
+    return "UNKNOWN";
+}
+
+struct Input {
+    double now = 0;
+    bool state_ok = false, pose_ok = false, velocity_ok = false, extended_ok = false;
+    bool connected = false, armed = false, gimbal_ready = true;
+    std::string mode;
+    int landed_state = 0; // MAVROS: 1=on ground, 2=in air
+    double x=0,y=0,z=0,yaw=0,vx=0,vy=0,vz=0,yaw_rate=0;
+    bool target_valid = false;
+    double target_time=-1, target_x=0,target_y=0,target_yaw=0,target_distance=-1;
+    // Body-centre target: camera target plus the camera-to-body offset. Only
+    // used for the final offset correction; the approach uses target_x/y.
+    double target_body_x=0,target_body_y=0;
+};
+
+struct Command {
+    bool publish = false;
+    bool request_offboard = false, request_arm = false, request_land = false;
+    land_motion::Velocity desired, velocity;
+    double desired_yaw_rate=0, yaw_rate=0;
+    bool planned_descent=false;
+    bool soft_yaw=false;
+    bool yaw_hold_active=false;
+    Phase phase=Phase::IDLE;
+};
+
+class Task {
+public:
+    explicit Task(const Config& config) : cfg(config) {}
+    Config cfg;
+    Phase phase() const { return phase_; }
+    const std::string& reason() const { return reason_; }
+    bool active() const { return enabled_; }
+    bool offboardSeen() const { return offboard_seen_; }
+    bool landRequested() const { return land_requested_; }
+    double inheritedAge(double now) const {return phase_==Phase::SHORT_LOSS?now-inherited_at_:-1;}
+    double inheritedTravel(const Input& i) const {return phase_==Phase::SHORT_LOSS?std::hypot(i.x-loss_x_,i.y-loss_y_):0;}
+    double searchStarted() const { return search_start_; }
+    // The same feedback goals used below by takeoff/hold/horizontal control.
+    // DESCEND has a velocity command, so Z here is a one-second lookahead.
+    land_motion::Velocity guidanceGoal(const Input& i) const {
+        if(phase_==Phase::SHORT_LOSS)return {inherit_horizontal_?inherited_x_:hold_x_,inherit_horizontal_?inherited_y_:hold_y_,hold_z_};
+        if(phase_==Phase::TAKEOFF)return {hold_x_,hold_y_,takeoff_z_};
+        if(phase_==Phase::TRANSLATE||phase_==Phase::STABILIZE)
+            return {i.target_x,i.target_y,hold_z_};
+        if(phase_==Phase::DESCEND)return {i.target_x,i.target_y,i.z-cfg.descent_speed};
+        if(phase_==Phase::TERMINAL_ALIGN)return {terminal_x_,terminal_y_,terminal_z_};
+        if(phase_==Phase::TERMINAL_DESCEND)return {terminal_x_,terminal_y_,i.z-cfg.terminal_descent_speed};
+        if(phase_==Phase::ROTATE)return {i.target_x,i.target_y,hold_z_};
+        if(phase_==Phase::BRAKE_TURN)return {i.x,i.y,hold_z_};
+        if(phase_==Phase::ACQUIRE||phase_==Phase::LOST_HOLD)return {hold_x_,hold_y_,hold_z_};
+        return {i.x,i.y,i.z};
+    }
+    unsigned descentFailedGates(const Input& i) const {
+        unsigned mask=0;
+        if(!targetFresh(i))mask|=1;
+        if(targetError(i)>cfg.align_enter_error)mask|=2;
+        if(cfg.align_yaw&&std::fabs(i.target_yaw)>cfg.yaw_tolerance)mask|=4;
+        if(std::hypot(i.vx,i.vy)>cfg.stable_xy_speed)mask|=8;
+        if(std::fabs(i.vz)>cfg.stable_z_speed)mask|=16;
+        if(std::fabs(i.yaw_rate)>cfg.stable_yaw_rate)mask|=32;
+        return mask;
+    }
+    double alignmentHoldSeconds(double now) const {return phase_==Phase::STABILIZE&&stable_at_>=0?std::max(0.0,now-stable_at_):0;}
+    double takeoffXYError(const Input& i) const { return std::hypot(hold_x_-i.x,hold_y_-i.y); }
+    double takeoffZError(const Input& i) const { return takeoff_z_-i.z; }
+    double takeoffHoldSeconds(double now) const {
+        return phase_==Phase::TAKEOFF&&stable_at_>=0?std::max(0.0,now-stable_at_):0.0;
+    }
+    // Bit 0=XY position, 1=height, 2=XY speed, 3=Z speed, 4=yaw rate.
+    unsigned takeoffFailedGates(const Input& i) const {
+        unsigned mask=0;
+        if(takeoffXYError(i)>cfg.takeoff_xy_tolerance)mask|=1;
+        if(std::fabs(takeoffZError(i))>cfg.takeoff_z_tolerance)mask|=2;
+        if(std::hypot(i.vx,i.vy)>cfg.takeoff_stable_xy_speed)mask|=4;
+        if(std::fabs(i.vz)>cfg.takeoff_stable_z_speed)mask|=8;
+        if(std::fabs(i.yaw_rate)>cfg.takeoff_stable_yaw_rate)mask|=16;
+        return mask;
+    }
+    double targetError(const Input& i) const { return std::hypot(i.target_x-i.x,i.target_y-i.y); }
+    bool targetFresh(const Input& i) const {
+        return i.target_valid && i.target_time >= enabled_at_ &&
+               i.now >= i.target_time && i.now-i.target_time <= cfg.target_timeout &&
+               std::isfinite(i.target_x) && std::isfinite(i.target_y) &&
+               std::isfinite(i.target_yaw) && std::isfinite(i.target_distance) && i.target_distance>0 &&
+               std::isfinite(i.target_body_x) && std::isfinite(i.target_body_y);
+    }
+    void cancel(const std::string& reason) {
+        enabled_=false; phase_=Phase::CANCELLED; reason_=reason; resetLimiter();
+    }
+    bool enable(const Input& i, std::string& reason) {
+        if (enabled_) { reason="task_already_enabled"; return false; }
+        if (!cfg.valid(reason)) return false;
+        if (!healthy(i) || !i.extended_ok) { reason="fresh_state_pose_velocity_landed_state_required"; return false; }
+        if (!cfg.auto_takeoff && (!i.armed || i.landed_state!=2)) {
+            reason="manual_mode_requires_airborne_and_armed"; return false;
+        }
+        if (cfg.auto_takeoff && i.landed_state!=1) { reason="auto_takeoff_requires_on_ground"; return false; }
+        enabled_=true; phase_=Phase::PRESTREAM; reason_="explicit_enable";
+        enabled_at_=i.now; phase_at_=i.now; last_tick_=i.now; prestream_start_=-1;
+        search_start_=-1; target_confirm_at_=-1; stable_at_=-1; final_at_=-1;
+        terminal_hover_=false;handoff_hold_=false;soft_yaw_latched_=false;terminal_yaw_=0;
+        last_request_=-1e9; offboard_seen_=i.mode=="OFFBOARD";
+        land_requested_=false; ever_acquired_=false; air_seen_=i.landed_state==2;
+        baseline_mode_=i.mode; hold_x_=i.x; hold_y_=i.y; hold_z_=i.z;
+        takeoff_z_=i.z+cfg.takeoff_altitude;
+        resetLimiter(); reason="enabled_waiting_for_prestream"; return true;
+    }
+
+    Command step(const Input& i) {
+        Command out;
+        if (!enabled_) { out.phase=phase_; return out; }
+        double dt=i.now-last_tick_;
+        if (!std::isfinite(dt) || dt<0 || dt>cfg.max_tick_gap) {
+            cancel("control_tick_gap"); out.phase=phase_; return out;
+        }
+        last_tick_=i.now;
+        control_dt_=dt;
+        if (!healthy(i)) { cancel("state_pose_or_velocity_timeout"); out.phase=phase_; return out; }
+        if (phase_==Phase::AUTO_LAND) {
+            if (i.mode!="AUTO.LAND") cancel("pilot_or_fcu_left_auto_land");
+            else if (i.extended_ok && i.landed_state==1 && !i.armed) complete("landed_and_disarmed");
+            out.phase=phase_; return out;
+        }
+        if (offboard_seen_ && i.mode!="OFFBOARD") {
+            if (phase_==Phase::LAND_HANDOFF && land_requested_ && i.mode=="AUTO.LAND") {
+                transition(Phase::AUTO_LAND,i.now,"auto_land_confirmed");
+                resetLimiter(); out.phase=phase_; return out;
+            }
+            cancel("pilot_or_fcu_left_offboard"); out.phase=phase_; return out;
+        }
+        if (phase_==Phase::PRESTREAM && !offboard_seen_ &&
+            i.mode!=baseline_mode_ && i.mode!="OFFBOARD") {
+            cancel("mode_changed_during_takeover"); out.phase=phase_; return out;
+        }
+        if (i.mode=="OFFBOARD") offboard_seen_=true;
+        if (phase_!=Phase::PRESTREAM && !i.armed) {
+            if (i.extended_ok && i.landed_state==1) complete("disarmed_on_ground");
+            else cancel("vehicle_disarmed");
+            out.phase=phase_; return out;
+        }
+        if (i.extended_ok && i.landed_state==2) air_seen_=true;
+        if (phase_!=Phase::PRESTREAM && phase_!=Phase::TAKEOFF && phase_!=Phase::LAND_HANDOFF && air_seen_ &&
+            i.extended_ok && i.landed_state==1) {
+            transition(Phase::LAND_HANDOFF,i.now,"ground_detected_request_auto_land");
+        }
+
+        if (phase_==Phase::PRESTREAM) {
+            if (i.now-enabled_at_>=cfg.takeover_timeout) {
+                cancel("takeover_timeout"); out.phase=phase_; return out;
+            }
+            if (!i.gimbal_ready) { out.phase=phase_; return out; }
+            if (prestream_start_<0) prestream_start_=i.now;
+            out.publish=true; // No setpoints at all before explicit enable.
+            if (i.now-prestream_start_>=cfg.prestream_seconds) {
+                if (i.mode!="OFFBOARD" && retry(i.now)) out.request_offboard=true;
+                else if (i.mode=="OFFBOARD") {
+                    if (cfg.auto_takeoff && !i.armed) {
+                        if (retry(i.now)) out.request_arm=true;
+                    } else if (i.armed) {
+                        hold_x_=i.x; hold_y_=i.y; hold_z_=i.z;
+                        transition(cfg.auto_takeoff?Phase::TAKEOFF:Phase::ACQUIRE,i.now,"takeover_confirmed");
+                        if (!cfg.auto_takeoff) search_start_=i.now;
+                    }
+                }
+            }
+            out.phase=phase_; return out;
+        }
+
+        out.publish=true;
+        const bool fresh=targetFresh(i);
+        const double error=targetError(i);
+        if (phase_==Phase::TAKEOFF) {
+            out.desired=land_motion::positionVelocity(hold_x_-i.x,hold_y_-i.y,takeoff_z_-i.z,
+                cfg.xy_kp,cfg.takeoff_kp,cfg.max_xy_speed,cfg.takeoff_speed,cfg.descent_speed);
+            const unsigned failed=takeoffFailedGates(i);
+            const bool arrived=failed==0;
+            reason_=arrived?"takeoff_stabilizing":
+                (failed&2)?"takeoff_wait_height":(failed&1)?"takeoff_wait_xy_position":
+                (failed&4)?"takeoff_wait_xy_speed":(failed&8)?"takeoff_wait_z_speed":"takeoff_wait_yaw_rate";
+            if (held(arrived,i.now,cfg.hover_seconds,stable_at_)) {
+                hold_x_=i.x; hold_y_=i.y; hold_z_=takeoff_z_;
+                transition(Phase::ACQUIRE,i.now,"takeoff_stable_search_started");
+                search_start_=i.now; // Initial 8 s timer starts here, never at node startup.
+            }
+            return finish(i,dt,out);
+        }
+        if (phase_==Phase::LAND_HANDOFF) {
+            // First brake to zero; AUTO.LAND subsequently owns descent speed.
+            if (i.now-phase_at_>=cfg.handoff_timeout) {
+                cancel("auto_land_handoff_timeout"); out.publish=false; out.phase=phase_; return out;
+            }
+            // Zero velocity is NOT a position hold in OFFBOARD: during the old
+            // 0.7 s handoff the aircraft drifted ~4 cm. Hold the entry point
+            // instead while waiting for AUTO.LAND to take over.
+            if(!handoff_hold_) {handoff_hold_=true;hold_x_=i.x;hold_y_=i.y;hold_z_=i.z;}
+            hold(out,i);
+            if (stopped(i) && previousSpeed()<0.015 && std::fabs(last_yaw_rate_)<0.005 && retry(i.now)) {
+                out.request_land=true; land_requested_=true;
+            }
+            return finish(i,dt,out);
+        }
+
+        if (phase_==Phase::SHORT_LOSS) {
+            // Hold altitude and brake yaw throughout an unobserved interval.
+            out.desired.z=std::max(0.0,clamp(cfg.z_kp*(hold_z_-i.z),cfg.descent_speed));
+            const bool within=i.now-inherited_at_<=cfg.short_loss_seconds && inheritedTravel(i)<cfg.short_loss_max_travel;
+            if(within&&inherit_horizontal_) {
+                auto v=land_motion::positionVelocity(inherited_x_-i.x,inherited_y_-i.y,0,
+                    cfg.xy_kp,1,cfg.short_loss_speed,cfg.max_z_speed,cfg.max_z_speed);
+                out.desired.x=v.x;out.desired.y=v.y;
+            }
+            if(held(fresh,i.now,cfg.reacquire_seconds,target_confirm_at_)) {
+                Phase resume=resume_phase_;
+                if(resume==Phase::DESCEND||resume==Phase::STABILIZE)resume=Phase::STABILIZE;
+                if(resume==Phase::ROTATE&&error>cfg.yaw_exit_error)resume=Phase::TRANSLATE;
+                transition(resume,i.now,"short_loss_fresh_target_reconfirmed");
+            } else if(!within) {
+                hold_x_=i.x;hold_y_=i.y;target_confirm_at_=-1;
+                transition(Phase::LOST_HOLD,i.now,"short_loss_budget_expired_hover");
+                out.desired.x=out.desired.y=0;
+            }
+            return finish(i,dt,out);
+        }
+
+        if (phase_==Phase::ACQUIRE || phase_==Phase::LOST_HOLD) {
+            hold(out,i);
+            if (held(fresh,i.now,cfg.target_confirm_seconds,target_confirm_at_)) {
+                ever_acquired_=true;
+                transition(Phase::TRANSLATE,i.now,"fresh_target_confirmed");
+            } else if (cfg.auto_takeoff && !ever_acquired_ && search_start_>=0 &&
+                       i.now-search_start_>=cfg.initial_target_timeout) {
+                transition(Phase::LAND_HANDOFF,i.now,"initial_target_timeout_land_here");
+                out.desired={};
+            }
+            return finish(i,dt,out);
+        }
+
+        if (phase_==Phase::TERMINAL_ALIGN) {
+            // Hover at the commit height and correct the camera-to-body offset
+            // before going blind. No marker observation is used here.
+            holdAltitude(out,i);
+            const auto v=land_motion::positionVelocity(terminal_x_-i.x,terminal_y_-i.y,0,
+                cfg.terminal_hold_kp,1.0,cfg.terminal_hold_speed,cfg.max_z_speed,cfg.max_z_speed);
+            double vx=v.x-cfg.terminal_hold_kd*i.vx,vy=v.y-cfg.terminal_hold_kd*i.vy;
+            const double n=std::hypot(vx,vy);
+            if(n>cfg.terminal_hold_speed&&n>0){vx*=cfg.terminal_hold_speed/n;vy*=cfg.terminal_hold_speed/n;}
+            out.desired.x=vx;out.desired.y=vy;
+            out.planned_descent=false;
+            if(cfg.terminal_heading_hold) {
+                out.desired_yaw_rate=clamp(cfg.terminal_heading_kp*angle(terminal_yaw_-i.yaw),
+                    cfg.terminal_heading_max_rate);
+                out.soft_yaw=true;
+            }
+            const double drift=std::hypot(i.x-terminal_x_,i.y-terminal_y_);
+            if(held(drift<=cfg.terminal_align_error&&std::hypot(i.vx,i.vy)<=cfg.stable_xy_speed,
+                    i.now,cfg.terminal_align_confirm_seconds,terminal_at_)) {
+                transition(Phase::TERMINAL_DESCEND,i.now,"terminal_offset_corrected_descend");
+            } else if(i.now-phase_at_>cfg.terminal_align_timeout) {
+                transition(Phase::TERMINAL_DESCEND,i.now,"terminal_align_timeout_descend");
+            }
+            return finish(i,dt,out);
+        }
+
+        if (phase_==Phase::TERMINAL_DESCEND) {
+            // Near the ground the FCU may not track the downward velocity or
+            // declare landed while OFFBOARD keeps a negative vz. Hand off to
+            // AUTO.LAND at a low local height instead of waiting for the timeout.
+            if(i.z<=cfg.terminal_land_height) {
+                transition(Phase::LAND_HANDOFF,i.now,"terminal_land_height_reached");
+                out.desired={};out.planned_descent=false;
+                return finish(i,dt,out);
+            }
+            // Blind descent: the target is frozen at the offset-corrected body
+            // position. The marker (and soft yaw) is not used any more; a slow
+            // position hold keeps ground effect from pushing the aircraft away.
+            const double drift=std::hypot(i.x-terminal_x_,i.y-terminal_y_);
+            const auto v=land_motion::positionVelocity(terminal_x_-i.x,terminal_y_-i.y,0,
+                cfg.terminal_hold_kp,1.0,cfg.terminal_hold_speed,cfg.max_z_speed,cfg.max_z_speed);
+            double vx=v.x-cfg.terminal_hold_kd*i.vx,vy=v.y-cfg.terminal_hold_kd*i.vy;
+            const double n=std::hypot(vx,vy);
+            if(n>cfg.terminal_hold_speed&&n>0){vx*=cfg.terminal_hold_speed/n;vy*=cfg.terminal_hold_speed/n;}
+            out.desired.x=vx;out.desired.y=vy;
+            out.desired.z=-cfg.terminal_descent_speed;
+            out.planned_descent=true;
+            if(cfg.terminal_heading_hold) {
+                out.desired_yaw_rate=clamp(cfg.terminal_heading_kp*angle(terminal_yaw_-i.yaw),
+                    cfg.terminal_heading_max_rate);
+                out.soft_yaw=true;
+            }
+            if(drift>cfg.terminal_max_drift) {
+                hold_x_=i.x;hold_y_=i.y;hold_z_=i.z;
+                transition(Phase::LOST_HOLD,i.now,"terminal_drift_guard_hold");
+                out.desired={};out.planned_descent=false;
+            } else if(i.z<terminal_z_-cfg.terminal_max_descent||i.now-phase_at_>cfg.terminal_timeout) {
+                transition(Phase::LAND_HANDOFF,i.now,"terminal_descent_bounded_land");
+                out.desired={};out.planned_descent=false;
+            }
+            return finish(i,dt,out);
+        }
+
+        if (!fresh) {
+            const double age=i.now-i.target_time;
+            if (phase_==Phase::DESCEND && i.target_time>=enabled_at_ &&
+                age>=0 && age<=cfg.near_ground_loss_seconds &&
+                i.target_distance>0 && i.target_distance<=cfg.final_marker_distance &&
+                error<=cfg.align_enter_error &&
+                (!cfg.align_yaw || std::fabs(i.target_yaw)<=cfg.yaw_tolerance)) {
+                transition(Phase::LAND_HANDOFF,i.now,"near_ground_marker_lost");
+                out.desired={};
+            } else if(phase_==Phase::DESCEND&&cfg.terminal_descent_enabled&&i.target_time>=enabled_at_&&
+                      age>=0&&age<=std::max(cfg.target_timeout,cfg.short_loss_seconds)&&
+                      std::isfinite(i.target_x)&&std::isfinite(i.target_y)&&
+                      std::isfinite(i.target_yaw)&&std::isfinite(i.target_distance)&&
+                      i.target_distance>0&&i.target_distance<=cfg.terminal_loss_depth&&
+                      error<=cfg.terminal_loss_error) {
+                // Marker vanished while already low and close: freeze the last
+                // accepted target and finish the descent instead of hovering.
+                terminal_x_=i.target_body_x;terminal_y_=i.target_body_y;terminal_z_=i.z;
+                hold_z_=i.z;terminal_yaw_=i.yaw;
+                transition(Phase::TERMINAL_ALIGN,i.now,"terminal_align_after_loss");
+                out.desired={};
+            } else if(cfg.short_loss_enabled&&i.target_time>=enabled_at_&&age>=0&&age<=cfg.short_loss_seconds&&
+                      std::isfinite(i.target_x)&&std::isfinite(i.target_y)&&std::isfinite(i.target_yaw)&&
+                      std::isfinite(i.target_distance)&&i.target_distance>0) {
+                resume_phase_=phase_;inherit_horizontal_=phase_!=Phase::ROTATE&&phase_!=Phase::BRAKE_TURN;
+                inherited_at_=i.target_time;inherited_x_=i.target_x;inherited_y_=i.target_y;
+                loss_x_=i.x;loss_y_=i.y;hold_x_=i.x;hold_y_=i.y;hold_z_=i.z;target_confirm_at_=-1;
+                transition(Phase::SHORT_LOSS,i.now,"short_loss_inherit_world_target_pause_descent");
+                // First missing frame commands braking; bounded inheritance starts next tick.
+                out.desired={};
+            } else {
+                hold_x_=i.x; hold_y_=i.y; hold_z_=i.z;
+                transition(Phase::LOST_HOLD,i.now,"target_invalid_or_stale_pause_descent");
+                target_confirm_at_=-1;
+                hold(out,i);
+            }
+            return finish(i,dt,out);
+        }
+
+        if (phase_==Phase::TRANSLATE) {
+            holdAltitude(out,i);
+            if (error>cfg.yaw_start_error) horizontal(out,i);
+            if(cfg.soft_yaw_approach) applySoftYaw(out,i);
+            // Translation must brake before a turn is permitted.
+            if (held(error<=cfg.yaw_start_error && stopped(i) && previousSpeed()<0.015,
+                     i.now,0.3,stable_at_)) {
+                transition(cfg.align_yaw?Phase::ROTATE:Phase::STABILIZE,i.now,"near_target_translation_stopped");
+            }
+        } else if (phase_==Phase::ROTATE) {
+            holdAltitude(out,i);
+            if (error>cfg.yaw_exit_error || std::fabs(i.target_yaw)<=cfg.yaw_tolerance) {
+                brake_to_translate_=error>cfg.yaw_exit_error;
+                transition(Phase::BRAKE_TURN,i.now,"turn_finished_or_position_drift");
+            } else {
+                // Large translation is complete. Small, bounded position feedback
+                // now holds the marker center while heading converges.
+                out.yaw_hold_active=true;
+                const auto v=land_motion::positionVelocity(i.target_x-i.x,i.target_y-i.y,0,
+                    cfg.yaw_hold_kp,1,cfg.yaw_hold_speed,cfg.max_z_speed,cfg.max_z_speed);
+                out.desired.x=v.x;out.desired.y=v.y;
+                if(previousHorizontalSpeed()<=cfg.yaw_hold_speed+0.005 &&
+                   std::hypot(i.vx,i.vy)<=cfg.stable_xy_speed)
+                    out.desired_yaw_rate=clamp(-cfg.yaw_kp*i.target_yaw,cfg.max_yaw_rate);
+            }
+        } else if (phase_==Phase::BRAKE_TURN) {
+            holdAltitude(out,i);
+            if (std::fabs(last_yaw_rate_)<0.005 && std::fabs(i.yaw_rate)<cfg.stable_yaw_rate) {
+                transition(brake_to_translate_?Phase::TRANSLATE:Phase::STABILIZE,i.now,"yaw_braked");
+            }
+        } else if (phase_==Phase::STABILIZE) {
+            holdAltitude(out,i); horizontal(out,i);
+            if(cfg.soft_yaw_approach) applySoftYaw(out,i);
+            if (error>cfg.align_exit_error) {
+                transition(Phase::TRANSLATE,i.now,"realign_horizontal");
+            } else if (cfg.align_yaw && std::fabs(i.target_yaw)>cfg.yaw_exit_tolerance) {
+                transition(Phase::ROTATE,i.now,"realign_yaw");
+                out.desired.x=out.desired.y=0;
+            } else if (held(aligned(i,error) && stopped(i),i.now,cfg.stable_seconds,stable_at_)) {
+                transition(Phase::DESCEND,i.now,"alignment_stable_descent_allowed");
+            }
+        } else if (phase_==Phase::DESCEND) {
+            if (error>cfg.align_exit_error ||
+                (cfg.align_yaw && std::fabs(i.target_yaw)>cfg.yaw_exit_tolerance)) {
+                hold_z_=i.z;
+                transition(Phase::STABILIZE,i.now,"alignment_lost_pause_descent");
+                holdAltitude(out,i); horizontal(out,i);
+            } else {
+                // Two ways to decide the marker is large: local height plus
+                // vision agreement, or the optical depth alone.
+                const bool close=(i.z<=cfg.terminal_height&&i.target_distance<=cfg.terminal_loss_depth)||
+                                 i.target_distance<=cfg.terminal_marker_depth;
+                if (cfg.terminal_descent_enabled && close) {
+                    // Large marker: hover here and centre it on the camera axis.
+                    // The camera offset is NOT applied during the approach; the
+                    // body-centre correction happens after this hover.
+                    if(!terminal_hover_) {terminal_hover_=true;hold_z_=i.z;reason_="terminal_hover_centering";}
+                    holdAltitude(out,i);
+                    horizontal(out,i);
+                    applySoftYaw(out,i);
+                    out.planned_descent=false;
+                    if (held(error<=cfg.terminal_center_error,i.now,cfg.terminal_confirm_seconds,terminal_at_)) {
+                        terminal_x_=i.target_body_x;terminal_y_=i.target_body_y;terminal_z_=i.z;
+                        hold_z_=i.z;
+                        terminal_yaw_=(cfg.soft_yaw_enabled&&soft_yaw_latched_&&targetFresh(i))
+                            ?soft_yaw_world_target_:i.yaw;
+                        transition(Phase::TERMINAL_ALIGN,i.now,"terminal_hover_centered_align_offset");
+                        out.desired={};out.planned_descent=false;
+                    }
+                } else {
+                    terminal_hover_=false;
+                    horizontal(out,i);
+                    out.desired.z=-cfg.descent_speed;
+                    out.planned_descent=true;
+                    if (held(i.target_distance>0 && i.target_distance<=cfg.final_marker_distance &&
+                             aligned(i,error),i.now,cfg.final_confirm_seconds,final_at_)) {
+                        transition(Phase::LAND_HANDOFF,i.now,"near_ground_aligned_land");
+                        out.desired={}; out.planned_descent=false;
+                    } else {
+                        // Gentle, bounded heading correction; it never gates descent.
+                        applySoftYaw(out,i);
+                    }
+                }
+            }
+        }
+        return finish(i,dt,out);
+    }
+
+private:
+    Phase phase_=Phase::IDLE;
+    std::string reason_="waiting_for_explicit_enable", baseline_mode_;
+    bool enabled_=false,offboard_seen_=false,land_requested_=false,ever_acquired_=false,air_seen_=false;
+    bool brake_to_translate_=false,inherit_horizontal_=false,terminal_hover_=false,handoff_hold_=false;
+    bool soft_yaw_latched_=false;
+    double soft_yaw_world_target_=0,terminal_yaw_=0;
+    Phase resume_phase_=Phase::TRANSLATE;
+    double inherited_at_=-1,inherited_x_=0,inherited_y_=0,loss_x_=0,loss_y_=0;
+    double enabled_at_=0,phase_at_=0,last_tick_=0,prestream_start_=-1,search_start_=-1;
+    double stable_at_=-1,target_confirm_at_=-1,final_at_=-1,terminal_at_=-1,last_request_=-1e9;
+    double hold_x_=0,hold_y_=0,hold_z_=0,takeoff_z_=0;
+    double terminal_x_=0,terminal_y_=0,terminal_z_=0;
+    land_motion::Velocity last_velocity_;
+    double last_yaw_rate_=0;
+    double integral_x_=0,integral_y_=0,integral_z_=0,control_dt_=0;
+    bool healthy(const Input& i) const {
+        if (!(i.state_ok && i.pose_ok && i.velocity_ok && i.connected)) return false;
+        for (double v : {i.now,i.x,i.y,i.z,i.yaw,i.vx,i.vy,i.vz,i.yaw_rate})
+            if (!std::isfinite(v)) return false;
+        return true;
+    }
+    void resetLimiter() { last_velocity_={}; last_yaw_rate_=0; resetIntegral(); }
+    void resetIntegral() { integral_x_=integral_y_=integral_z_=0; }
+    void complete(const std::string& reason) { enabled_=false;phase_=Phase::COMPLETE;reason_=reason;resetLimiter(); }
+    bool retry(double now) { if (now-last_request_<cfg.retry_seconds) return false;last_request_=now;return true; }
+    static bool held(bool condition,double now,double duration,double& since) {
+        if (!condition) { since=-1; return false; }
+        if (since<0) since=now;
+        return now-since>=duration;
+    }
+    bool stopped(const Input& i) const {
+        return std::hypot(i.vx,i.vy)<=cfg.stable_xy_speed && std::fabs(i.vz)<=cfg.stable_z_speed &&
+               std::fabs(i.yaw_rate)<=cfg.stable_yaw_rate;
+    }
+    bool aligned(const Input& i,double error) const {
+        return error<=cfg.align_enter_error && (!cfg.align_yaw || std::fabs(i.target_yaw)<=cfg.yaw_tolerance);
+    }
+    double previousHorizontalSpeed() const { return std::hypot(last_velocity_.x,last_velocity_.y); }
+    double previousSpeed() const { return std::hypot(previousHorizontalSpeed(),last_velocity_.z); }
+    void transition(Phase next,double now,const std::string& reason) {
+        phase_=next;phase_at_=now;reason_=reason;stable_at_=-1;final_at_=-1;terminal_at_=-1;terminal_hover_=false;handoff_hold_=false;
+        resetIntegral();
+    }
+    void holdAltitude(Command& out,const Input& i) {
+        double iz=0;
+        if(cfg.z_ki>0&&control_dt_>0) {
+            integral_z_+=(hold_z_-i.z)*control_dt_;
+            iz=clamp(cfg.z_ki*integral_z_,cfg.z_integral_limit);
+            integral_z_=iz/cfg.z_ki;
+        }
+        out.desired.z=clamp(cfg.z_kp*(hold_z_-i.z)-cfg.z_kd*i.vz+iz,cfg.descent_speed);
+    }
+    // Soft heading correction toward the nearest marker edge. A square marker is
+    // 4-fold symmetric, so a per-frame fold of the edge angle flips direction
+    // when the nose is near the perpendicular boundary (+/-90 deg). Latch the
+    // chosen EDGE ONCE into a world heading and steer to that fixed heading;
+    // after that the correction is continuous and cannot flip. The rate stays
+    // small and this correction never blocks or pauses the descent.
+    void applySoftYaw(Command& out,const Input& i) {
+        if(!cfg.soft_yaw_enabled||!targetFresh(i))return;
+        if(!soft_yaw_latched_) {
+            const double raw=angle(i.target_yaw);
+            double rel;
+            if(cfg.soft_yaw_to_top_edge) {
+                // Nose parallel to the corner0->1 (top) edge: raw = +/-90 deg.
+                rel=angle(raw-kPi/2.0);
+                if(rel>kPi/2.0) rel-=kPi;
+                else if(rel<-kPi/2.0) rel+=kPi;
+            } else {
+                // Nearest of the four edges (old behaviour).
+                rel=angle(raw-kPi/2.0*std::round(raw/(kPi/2.0)));
+            }
+            // The rate below turns the nose by -rel, so that is the world heading.
+            soft_yaw_world_target_=angle(i.yaw-rel);
+            soft_yaw_latched_=true;
+        }
+        const double err=angle(soft_yaw_world_target_-i.yaw);
+        if(std::fabs(err)<=cfg.soft_yaw_deadband)return;
+        out.desired_yaw_rate=clamp(cfg.soft_yaw_kp*err,cfg.soft_yaw_max_rate);
+        out.soft_yaw=true;
+    }
+    // Shared horizontal law: P + measured-velocity D + optional clamped I.
+    void desiredHorizontal(Command& out,const Input& i,double goal_x,double goal_y) {
+        const double ex=goal_x-i.x,ey=goal_y-i.y;
+        const auto v=land_motion::positionVelocity(ex,ey,0,
+            cfg.xy_kp,1.0,cfg.max_xy_speed,cfg.max_z_speed,cfg.max_z_speed);
+        double vx=v.x-cfg.xy_kd*i.vx,vy=v.y-cfg.xy_kd*i.vy;
+        if(cfg.xy_ki>0&&control_dt_>0) {
+            integral_x_+=ex*control_dt_;integral_y_+=ey*control_dt_;
+            double ix=cfg.xy_ki*integral_x_,iy=cfg.xy_ki*integral_y_;
+            const double inorm=std::hypot(ix,iy);
+            if(inorm>cfg.xy_integral_limit&&inorm>0) {
+                ix*=cfg.xy_integral_limit/inorm;iy*=cfg.xy_integral_limit/inorm;
+                integral_x_=ix/cfg.xy_ki;integral_y_=iy/cfg.xy_ki;
+            }
+            vx+=ix;vy+=iy;
+        }
+        const double norm=std::hypot(vx,vy);
+        if(norm>cfg.max_xy_speed&&norm>0){vx*=cfg.max_xy_speed/norm;vy*=cfg.max_xy_speed/norm;}
+        out.desired.x=vx;out.desired.y=vy;
+    }
+    void horizontal(Command& out,const Input& i) {
+        desiredHorizontal(out,i,i.target_x,i.target_y);
+    }
+    void hold(Command& out,const Input& i) {
+        desiredHorizontal(out,i,hold_x_,hold_y_);
+        double iz=0;
+        if(cfg.z_ki>0&&control_dt_>0) {
+            integral_z_+=(hold_z_-i.z)*control_dt_;
+            iz=clamp(cfg.z_ki*integral_z_,cfg.z_integral_limit);
+            integral_z_=iz/cfg.z_ki;
+        }
+        out.desired.z=clamp(cfg.z_kp*(hold_z_-i.z)-cfg.z_kd*i.vz+iz,cfg.descent_speed);
+    }
+    Command finish(const Input&,double dt,Command out) {
+        const double xy=std::hypot(out.desired.x,out.desired.y);
+        if (xy>cfg.max_xy_speed) {out.desired.x*=cfg.max_xy_speed/xy;out.desired.y*=cfg.max_xy_speed/xy;}
+        out.desired.z=clamp(out.desired.z,cfg.max_z_speed);
+        out.desired_yaw_rate=clamp(out.desired_yaw_rate,cfg.max_yaw_rate);
+        // Only near-target ROTATE may combine yaw with a bounded micro-hold.
+        // Other stages, stale observations and drift exits still brake first.
+        if(out.yaw_hold_active) {
+            const double v=std::hypot(out.desired.x,out.desired.y);
+            if(v>cfg.yaw_hold_speed){out.desired.x*=cfg.yaw_hold_speed/v;out.desired.y*=cfg.yaw_hold_speed/v;}
+            if(previousHorizontalSpeed()>cfg.yaw_hold_speed+0.005)out.desired_yaw_rate=0;
+        } else {
+            if (std::fabs(last_yaw_rate_)>=0.005 && !out.soft_yaw) out.desired.x=out.desired.y=0;
+            if (previousHorizontalSpeed()>=0.005 && !out.soft_yaw) out.desired_yaw_rate=0;
+        }
+        double dx=out.desired.x-last_velocity_.x,dy=out.desired.y-last_velocity_.y;
+        const double change=std::hypot(dx,dy),allowed=cfg.max_xy_accel*dt;
+        if (change>allowed && change>0) {dx*=allowed/change;dy*=allowed/change;}
+        out.velocity.x=last_velocity_.x+dx;out.velocity.y=last_velocity_.y+dy;
+        out.velocity.z=last_velocity_.z+clamp(out.desired.z-last_velocity_.z,cfg.max_z_accel*dt);
+        out.yaw_rate=last_yaw_rate_+clamp(out.desired_yaw_rate-last_yaw_rate_,cfg.max_yaw_accel*dt);
+        last_velocity_=out.velocity;last_yaw_rate_=out.yaw_rate;
+        out.phase=phase_;return out;
+    }
+};
+} // namespace land_task
+#endif

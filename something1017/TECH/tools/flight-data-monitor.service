@@ -1,0 +1,16 @@
+[Unit]
+Description=Read-only ROS flight telemetry and recorder
+After=network-online.target Safina_sensor.service
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/home/orangepi/something1017/TECH/tools
+ExecStart=/bin/bash /home/orangepi/something1017/TECH/tools/run_flight_monitor.sh
+Restart=always
+RestartSec=5
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target

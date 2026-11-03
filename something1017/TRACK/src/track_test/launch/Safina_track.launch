@@ -1,0 +1,7 @@
+<launch>
+
+    <node pkg="track_test" type="Safina_track_test" name="Safina_track_test" output="screen">
+        <rosparam file="$(find track_test)/config/track.yaml" command="load"/>
+    </node>
+
+</launch>

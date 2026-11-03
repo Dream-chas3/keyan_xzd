@@ -1,0 +1,8 @@
+prefix=/home/orangepi/something1017/TECH
+
+Name: to_mavros
+Description: Description of to_mavros
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

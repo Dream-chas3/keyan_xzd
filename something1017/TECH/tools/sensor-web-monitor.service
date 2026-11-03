@@ -1,0 +1,14 @@
+[Unit]
+Description=Orange Pi ROS Sensor Web Monitor
+After=network-online.target Safina_sensor.service
+
+[Service]
+Type=simple
+User=orangepi
+WorkingDirectory=/home/orangepi/something1017/TECH/tools
+ExecStart=/home/orangepi/something1017/TECH/tools/run_sensor_web_monitor.sh
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

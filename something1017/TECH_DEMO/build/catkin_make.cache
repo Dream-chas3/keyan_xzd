@@ -1,0 +1,2 @@
+OrbbecSDK_ROS1-2-main:aruco_test:land_test:map_test:offboard_ctl:pcl_test:planner_test:rtsp_test:waypoint_mission
+-DCATKIN_DEVEL_PREFIX=/home/orangepi/something1017/TECH_DEMO/devel -DCMAKE_INSTALL_PREFIX=/home/orangepi/something1017/TECH_DEMO/install -G Unix Makefiles

@@ -1,0 +1,128 @@
+# ============================================================================
+# Safina YOLO 识别 + 人物 ID 跟踪参数
+# 文件位置: ~/something1017/TRACK/src/yoloUltra_test/config/yolo_track.yaml
+# 加载方式: Safina_yoloUltra_test.launch 里用 <rosparam> 加载到节点私有命名空间(~)
+#
+# 说明: ID 跟踪只在 “PX4 OFFBOARD + SWA 中档” 时启用。
+#       进入中档后 ID 从 1 开始编号；切到上档保护不会重置，回到中档继续原 ID。
+#       切到下档或离开 OFFBOARD 后会话结束，下次中档重新从 1 开始。
+#       第一个人为 ID 1 并作为跟踪目标，后来的人依次 ID 2、3...
+#       目标 ID 1 丢失后保持，等待新的人出现再跟踪。
+# ============================================================================
+
+model_file: /home/orangepi/something1017/TRACK/src/yoloUltra_test/weights/yolov11_s_det_int.rknn
+
+# 相机分辨率(与 Orbbec 彩色图像一致)
+camera_rows: 720
+camera_cols: 1280
+
+# 相机内参(来自 /camera/color/camera_info 实测值)
+camera_fx: 613.3737182617188
+camera_fy: 613.2047119140625
+camera_cx: 644.221923828125
+camera_cy: 363.62823486328125
+
+detection:
+  # NMS 之前的候选框置信度(所有检测的总闸)
+  object_threshold: 0.20
+  # NMS IoU 阈值
+  nms_threshold: 0.25
+  # 只保留 COCO 的 person 类
+  class_id: 0
+  # 画原始检测框的最低置信度
+  draw_confidence: 0.50
+
+tracker:
+  # 新出现的人达到这个置信度才分配新 ID(防止误检产生 ID)
+  new_track_confidence: 0.50
+  # 已存在的 ID 只要检测置信度高于这个值就保持
+  match_confidence: 0.20
+  # 帧间关联: IoU 阈值
+  assoc_iou_threshold: 0.25
+  # 帧间关联: 中心点距离阈值(相对图像对角线)
+  assoc_center_ratio: 0.10
+  # 帧间关联: 框高比例容差，防止把远近不同的人接到同一个 ID
+  assoc_size_tol: 0.60
+  # 一个 ID 连续消失超过这个时间就删除。
+  # 调大到 3 秒可以扛住短暂遮挡，不会马上丢主目标。
+  track_loss_timeout_s: 3.00
+
+  # ---- 主目标“咬住”门限 ----
+  # 主目标只接受满足以下条件的检测：
+  #   预测中心附近 / IoU 足够 / 框高与上一帧接近
+  # 路人从旁边走过、距离/大小明显不同时不会抢走主目标。
+  primary_iou_min: 0.15
+  primary_center_ratio: 0.10      # 相对图像对角线
+  primary_size_tol: 0.35          # 框高比例容差
+  primary_predict_s: 0.20         # 速度预测时间
+  max_predict_speed_ratio: 0.50   # 预测速度上限(对角线/秒)
+
+  # ---- 主目标丢失后的重获门限 ----
+  # 只在“上次主目标位置附近 + 框高相似”的人出现时才接受为新主目标；
+  # 远处的路人不会被接替。想接受画面里任何一个人可设 any_visible。
+  reacquire_radius_ratio: 0.25    # 相对图像对角线
+  reacquire_size_min_ratio: 0.50
+  reacquire_size_max_ratio: 2.00
+  # 兜底：主目标丢失并超过 track_loss_timeout_s 后，再等这么久仍没有
+  # “原位置/原大小”的人，就选择画面里最接近原位置/大小的人，避免明明有人
+  # 却一直不跟。0 = 关闭兜底（一直等原位置的人）。
+  reacquire_fallback_s: 1.50
+
+  # 主目标丢失后的重新捕获策略:
+  #   new_track   - 只接受在上一主目标最后可见之后才出现、且满足上面门限的人
+  #   any_visible - 接受当前画面里任何一个人(包括原本的 ID 2)
+  reacquire_mode: new_track
+  # 同时维护的最大人数
+  max_tracks: 20
+  # 飞行模式: true  = 只有 PX4 OFFBOARD + SWA 中档才分配 ID
+  # 台架模式: false = POSCTL + SWA 中档也分配 ID，仅用于地面看 ID
+  #           台架模式不发布任何设定点，不会启动电机。
+  # 启动时可用 roslaunch ... require_offboard:=false 覆盖本项。
+  require_offboard: true
+
+offset:
+  # 距离是图像启发式，不是米制测距:
+  # 脚底到画面底边中心的径向像素距离 radial
+  # radial <= deadband 时前向速度为 0
+  # radial 达到 full_scale 时前向系数为 1.0
+  standoff_deadband_px: 70.0
+  standoff_full_scale_px: 150.0
+
+# ---- 深度融合测距 ----
+# 使用 /camera/depth/image_raw (16UC1, mm, 848x480, ~10 Hz)。
+# 深度图没有对齐到彩色图，所以用下面的外参把彩色人框映射到深度相机。
+# 外参来自 /camera/depth_to_color（depth -> color），旋转为行优先。
+# 每帧只在人框躯干区域取 grid×grid 个点，算力开销很小。
+depth:
+  enabled: true
+  fx: 416.2961730957031
+  fy: 416.2961730957031
+  cx: 423.3375244140625
+  cy: 238.01251220703125
+  extrinsic_rotation: [0.99999887, -0.00046183, -0.00142059,
+                       0.00046162, 0.99999988, -0.00015206,
+                       0.00142066, 0.0001514, 0.99999899]
+  extrinsic_translation: [-0.02367074, 0.00010004, 7.857e-05]
+  max_age_s: 0.30          # 深度图超过这个时间视为无效
+  min_range_m: 0.30
+  max_range_m: 8.00
+  # 在人框里的采样区域（0~1，相对人框）
+  roi_x_min: 0.30
+  roi_x_max: 0.70
+  roi_y_min: 0.25
+  roi_y_max: 0.65
+  grid: 7                  # 7x7 = 49 个采样点
+  min_valid_ratio: 0.30    # 有效深度比例低于此值则判深度无效
+  outlier_m: 0.50          # 与中值相差超过此值的点视为背景/边缘并剔除
+
+distance:
+  # 深度无效时的兜底：距离 d = fy * person_height_m / 人框像素高度
+  person_height_m: 1.70
+  filter_frames: 5         # 最近 5 帧中值平滑
+  min_bbox_height_px: 80.0 # 框太小时框高法不可靠
+
+# SWA 第9通道 PWM 阈值。必须与 track.yaml 保持一致。
+# 上档≈1075, 中档≈1494, 下档≈1913
+swa:
+  up_max_pwm: 1211
+  mid_max_pwm: 1757

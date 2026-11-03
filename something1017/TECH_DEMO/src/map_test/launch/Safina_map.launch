@@ -1,0 +1,4 @@
+<launch>
+	<rosparam file="$(find map_test)/config/occmap.yaml" ns="/occmap" command="load" />
+	<node pkg="map_test" type="Safina_map_test" name="Safina_map_test" output="screen" />
+</launch>

@@ -1,0 +1,4 @@
+<launch>
+
+	<node pkg="pcl_test" type="Safina_pcl_test" name="Safina_pcl_test" output="screen" />
+</launch>

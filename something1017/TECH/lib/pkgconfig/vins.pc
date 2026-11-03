@@ -1,0 +1,8 @@
+prefix=/home/orangepi/something1017/TECH
+
+Name: vins
+Description: Description of vins
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

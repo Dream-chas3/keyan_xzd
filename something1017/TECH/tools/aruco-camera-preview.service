@@ -1,0 +1,15 @@
+[Unit]
+Description=On-demand read-only ArUco JPEG preview
+After=network.target
+
+[Service]
+Type=simple
+User=orangepi
+ExecStart=/bin/bash /home/orangepi/something1017/TECH/tools/run_aruco_preview.sh
+Restart=on-failure
+RestartSec=5
+Nice=15
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

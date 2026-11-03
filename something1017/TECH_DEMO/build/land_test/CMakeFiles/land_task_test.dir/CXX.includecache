@@ -1,0 +1,34 @@
+#IncludeRegexLine: ^[ 	]*[#%][ 	]*(include|import)[ 	]*[<"]([^">]+)([">])
+
+#IncludeRegexScan: ^.*$
+
+#IncludeRegexComplain: ^$
+
+#IncludeRegexTransform: 
+
+/home/orangepi/something1017/TECH_DEMO/src/land_test/include/land_test/landing_task.h
+land_test/motion_limits.h
+/home/orangepi/something1017/TECH_DEMO/src/land_test/include/land_test/land_test/motion_limits.h
+cmath
+-
+limits
+-
+string
+-
+
+/home/orangepi/something1017/TECH_DEMO/src/land_test/include/land_test/motion_limits.h
+algorithm
+-
+cmath
+-
+
+/home/orangepi/something1017/TECH_DEMO/src/land_test/test/landing_task_test.cpp
+land_test/landing_task.h
+/home/orangepi/something1017/TECH_DEMO/src/land_test/test/land_test/landing_task.h
+cassert
+-
+iostream
+-
+limits
+-
+

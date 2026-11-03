@@ -1,0 +1,78 @@
+# ============================================================================
+# Safina 人物跟踪控制参数
+# 文件位置: ~/something1017/TRACK/src/track_test/config/track.yaml
+# 加载方式: Safina_track.launch 里用 <rosparam> 加载到节点私有命名空间(~)
+#
+# 重要: 本节点不会解锁、不会主动切 OFFBOARD。
+#       飞手先在定点模式手动飞到想要的位置，再把 SWG 拨到 OFFBOARD 档。
+# ============================================================================
+
+# 控制定时器频率。与图像帧率解耦，图像断了也会持续发设定点。
+control_rate_hz: 20.0
+
+# true: 只有 PX4 处于 OFFBOARD 时才执行 SWA 功能(推荐)
+# false: 仅用于台架测试，不要真机飞行时设为 false
+require_offboard: true
+
+# /Safina_track 超过这个时间没更新，视为没有目标
+target_timeout_s: 0.5
+
+# 目标短暂丢失时的减速宽限时间(秒)。超过后切换为定点保持。
+target_loss_grace_s: 0.3
+
+# /mavros/local_position/pose 和 /mavros/rc/in 的超时
+pose_timeout_s: 0.5
+rc_timeout_s: 1.0
+
+# ---- 跟踪速度映射 ----
+# 前向速度 = tracking_vlxy * x_offset，x_offset 由 yolo 节点给出 [-1, 1]
+tracking_vlxy: 0.80
+max_forward_speed: 0.30      # m/s，前向最大速度
+max_backward_speed: 0.15     # m/s，太近时后退最大速度
+
+# 偏航速率 = tracking_ryaw * y_offset，y_offset 为 [-1, 1]
+tracking_ryaw: 1.50
+max_yaw_rate: 1.20           # rad/s
+
+# ---- 米制定距 ----
+# yolo 发布融合距离（深度/框高）时，前向速度改为：
+#   vx = distance_kp * (measured_distance - target_distance_m)
+# 深度无效时自动回退到上面的像素法 tracking_vlxy * x_offset。
+use_metric_distance: true
+target_distance_m: 2.00      # 想保持的距离（米）
+distance_kp: 0.50            # 1/s，0.5 m 误差 -> 0.25 m/s
+distance_deadband_m: 0.20    # ±0.2 m 内不前后移动
+
+# 低于这个高度时，即使 OFFBOARD + 中档也只保持，不开始跟踪(防止地面拖行)
+min_tracking_height_m: 0.30
+# 地面保护: 同时检查 /mavros/extended_state 的 landed_state
+# ON_GROUND / LANDING 时禁止开始跟踪，优先级高于上面的高度判断
+use_landed_state: true
+landed_state_timeout_s: 1.0
+
+# ---- 高度保持 ----
+# 高度目标是切入 OFFBOARD 那一刻的高度(可用 altitude_offset_m 微调)
+altitude_kp: 0.80
+altitude_kd: 0.20
+altitude_offset_m: 0.0       # + 为比切入高度更高，- 为更低
+max_climb_speed: 0.40        # m/s
+max_descent_speed: 0.30      # m/s
+
+# ---- 加速度/斜率限制 ----
+max_xy_accel: 0.60           # m/s^2
+max_z_accel: 0.50            # m/s^2
+max_yaw_accel: 1.00          # rad/s^2
+
+# ---- 原地降落 ----
+landing_descent_speed: 0.20  # m/s
+landing_switch_height: 0.10  # m，低于此高度请求 AUTO.LAND
+landing_timeout_s: 20.0      # 超时后也请求 AUTO.LAND
+
+# ---- SWA 第9通道 PWM 阈值 ----
+# 实测: 上档≈1075, 中档≈1494, 下档≈1913
+# <= up_max_pwm          -> 上档(保护性保持，绝不起飞)
+# <= mid_max_pwm         -> 中档(人物跟踪)
+# >  mid_max_pwm         -> 下档(进OFFBOARD时保持；离开过下档后再回下档则原地降落)
+swa:
+  up_max_pwm: 1211
+  mid_max_pwm: 1757

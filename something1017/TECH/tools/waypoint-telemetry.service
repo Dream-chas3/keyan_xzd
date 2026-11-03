@@ -1,0 +1,15 @@
+[Unit]
+Description=Waypoint mission read-only telemetry bridge (HTTP 8770)
+After=network-online.target Safina_sensor.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=orangepi
+ExecStart=/bin/bash /home/orangepi/something1017/TECH/tools/run_waypoint_telemetry.sh
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+<?xml version="1.0"?>
+<package format="2">
+  <name>waypoint_mission</name>
+  <version>0.1.0</version>
+  <description>Data-driven OFFBOARD waypoint mission with RC OFFBOARD edge start gate, async camera trigger and async gimbal control.</description>
+  <maintainer email="safina@todo.todo">safina</maintainer>
+  <license>TODO</license>
+
+  <buildtool_depend>catkin</buildtool_depend>
+  <depend>roscpp</depend>
+  <depend>roslib</depend>
+  <depend>std_msgs</depend>
+  <depend>geometry_msgs</depend>
+  <depend>nav_msgs</depend>
+  <depend>sensor_msgs</depend>
+  <depend>mavros_msgs</depend>
+  <depend>cv_bridge</depend>
+  <depend>tf2</depend>
+  <depend>tf2_geometry_msgs</depend>
+  <build_depend>yaml-cpp</build_depend>
+  <exec_depend>yaml-cpp</exec_depend>
+  <exec_depend>rtsp_test</exec_depend>
+</package>

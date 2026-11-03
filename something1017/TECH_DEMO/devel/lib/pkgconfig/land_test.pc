@@ -1,0 +1,8 @@
+prefix=/home/orangepi/something1017/TECH_DEMO/devel
+
+Name: land_test
+Description: Description of land_test
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

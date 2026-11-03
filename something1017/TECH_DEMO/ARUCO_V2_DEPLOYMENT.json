@@ -1,0 +1,51 @@
+{
+  "version": "v2.5-position-only-landing",
+  "time": "2026-10-27 16:56:29",
+  "backup": "/home/orangepi/.ros/backups/aruco_position_only_20261027_165629",
+  "flight_nodes_started": false,
+  "before_state": {
+    "armed": false,
+    "mode": "POSCTL"
+  },
+  "files": {
+    "TECH_DEMO/src/land_test/include/land_test/landing_task.h": "44d82eaf478faa4a5f95aead915630e1ee724d42bfe57c67d00a4d84cf5e7354",
+    "TECH_DEMO/src/land_test/include/land_test/Safina_land_test.h": "3f712fe646e9aaa727753cbc67d56ecd5d1cf9ab09c29dc04312945a33d2caa6",
+    "TECH_DEMO/src/land_test/src/Safina_land_test.cpp": "cab6133c88352c00553dab968297dccca500cf687f1ebfa32922fcac4bfa465e",
+    "TECH_DEMO/src/land_test/test/landing_task_test.cpp": "69c7a04192dde33aa08ffbd6b1f9f62692b6e9cb256b8d733b0b1079ea59709b",
+    "TECH_DEMO/src/land_test/test/isolated_ros_test.py": "aaeacccc523594f1a8b00da2b34122aab8dc7d97280ec0176eac6c0ab717f3dd",
+    "TECH_DEMO/src/aruco_test/include/aruco_test/Safina_aruco_test.h": "f88eac6624205b492a38ff878a8e40649da0f150b80a10b812e2325819b8b13e",
+    "TECH_DEMO/src/aruco_test/src/Safina_aruco_test.cpp": "361b250806a33dd20ad825071d045bcf111006edced4b4137845f2f2ab483106",
+    "TECH_DEMO/devel/lib/land_test/Safina_land_test": "8e47365e21d62d23d42edeafc87b1e7f56a189a8fdc58760ae60131645376b81",
+    "TECH_DEMO/devel/lib/aruco_test/Safina_aruco_test": "42757c2e021b8de85369fbc392bdf9cf29d70f00bfc2dcd19e3688a566fdf45c",
+    "TECH_DEMO/src/land_test/config/takeoff_land.yaml": "302be00b90bf3bd1f7e186f3f8fbc6f9eecff9fc0355dab3975b73801e621df6"
+  },
+  "config_changes": {
+    "align_yaw": false,
+    "yaw_hold_speed": 0.06,
+    "yaw_hold_kp": 0.6,
+    "max_yaw_rate": 0.1,
+    "gimbal_down_on_startup": true,
+    "short_loss_enabled": true,
+    "short_loss_seconds": 0.6,
+    "short_loss_speed": 0.05,
+    "short_loss_max_travel": 0.03,
+    "reacquire_seconds": 0.1,
+    "yaw_start_error": 0.12,
+    "yaw_exit_error": 0.18,
+    "align_enter_error": 0.1,
+    "align_exit_error": 0.16,
+    "yaw_tolerance": 0.174532925,
+    "yaw_exit_tolerance": 0.261799388,
+    "stable_seconds": 0.5,
+    "stable_xy_speed": 0.08,
+    "stable_z_speed": 0.08,
+    "stable_yaw_rate": 0.05,
+    "target_confirm_seconds": 0.15
+  },
+  "marker_changes": {
+    "roi_enabled": true,
+    "full_search_scale": 0.75,
+    "full_search_period": 0.6,
+    "roi_margin_px": 120
+  }
+}

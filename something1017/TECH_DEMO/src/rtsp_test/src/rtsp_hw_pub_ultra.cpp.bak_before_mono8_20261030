@@ -1,0 +1,272 @@
+#include <ros/ros.h>
+#include <sensor_msgs/Image.h>
+#include <cv_bridge/cv_bridge.h>
+#include <opencv2/opencv.hpp>
+
+extern "C" {
+#include <libavformat/avformat.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/avutil.h>
+#include <libavutil/imgutils.h>
+#include <libavutil/time.h>
+}
+
+#include "rk_mpi.h"
+#include "mpp_buffer.h"
+#include "mpp_frame.h"
+#include "mpp_packet.h"
+
+#define mpp_err printf
+
+// ---- 解码器上下文 ----
+typedef struct {
+    MppCtx ctx;
+    MppApi *mpi;
+    MppPacket packet;
+    MppFrame frame;
+    MppBufferGroup buf_mgr;
+    RK_U32 width, height, hor_stride, ver_stride;
+    MppCodingType coding_type;
+    MppFrameFormat output_format;
+    int info_changed;
+    int decoder_initialized;
+    AVCodecParserContext *parser;
+    AVCodecContext *parser_ctx;
+    uint8_t *extradata;
+    int extradata_size;
+    int extradata_sent;
+} DecoderContext;
+
+// ---- MPP 缓冲区管理 ----
+static MPP_RET dec_buf_mgr_init(MppBufferGroup *buf_mgr) {
+    MppBufferGroup group = NULL;
+    MPP_RET ret = mpp_buffer_group_get_internal(&group, MPP_BUFFER_TYPE_ION);
+    if (ret != MPP_OK) mpp_err("buffer group init failed\n");
+    *buf_mgr = group;
+    return ret;
+}
+
+static void dec_buf_mgr_deinit(MppBufferGroup buf_mgr) {
+    if (buf_mgr) mpp_buffer_group_put(buf_mgr);
+}
+
+// ---- 解码器初始化 / 销毁 ----
+static int send_extradata_to_decoder(DecoderContext *dec) {
+    if (!dec->extradata || dec->extradata_sent) return 0;
+    MPP_RET ret = mpp_packet_init(&dec->packet, dec->extradata, dec->extradata_size);
+    if (ret != MPP_OK) { mpp_err("extradata packet init fail\n"); return -1; }
+    ret = dec->mpi->decode_put_packet(dec->ctx, dec->packet);
+    if (ret != MPP_OK) { mpp_err("send extradata fail\n"); return -1; }
+    dec->extradata_sent = 1;
+    return 0;
+}
+
+static int init_decoder(DecoderContext *dec, MppCodingType type, RK_U32 width, RK_U32 height,
+                        uint8_t *extradata, int extradata_size) {
+    memset(dec, 0, sizeof(*dec));
+    dec->coding_type = type;
+    dec->width = width;
+    dec->height = height;
+    dec->output_format = MPP_FMT_YUV420SP;
+
+    if (extradata && extradata_size > 0) {
+        dec->extradata = (uint8_t*)malloc(extradata_size);
+        memcpy(dec->extradata, extradata, extradata_size);
+        dec->extradata_size = extradata_size;
+    }
+
+    if (mpp_create(&dec->ctx, &dec->mpi) != MPP_OK) { mpp_err("mpp_create fail\n"); return -1; }
+    if (mpp_init(dec->ctx, MPP_CTX_DEC, dec->coding_type) != MPP_OK) { mpp_err("mpp_init fail\n"); return -1; }
+    dec->mpi->control(dec->ctx, MPP_DEC_SET_OUTPUT_FORMAT, &dec->output_format);
+
+    if (dec_buf_mgr_init(&dec->buf_mgr) != MPP_OK) return -1;
+    if (dec->buf_mgr) dec->mpi->control(dec->ctx, MPP_DEC_SET_EXT_BUF_GROUP, dec->buf_mgr);
+    if (mpp_packet_init(&dec->packet, NULL, 0) != MPP_OK) return -1;
+
+    dec->parser = av_parser_init(AV_CODEC_ID_H264);
+    dec->parser_ctx = avcodec_alloc_context3(NULL);
+    if (dec->parser_ctx && extradata && extradata_size > 0) {
+        dec->parser_ctx->extradata = (uint8_t*)av_mallocz(extradata_size + AV_INPUT_BUFFER_PADDING_SIZE);
+        memcpy(dec->parser_ctx->extradata, extradata, extradata_size);
+        dec->parser_ctx->extradata_size = extradata_size;
+    }
+
+    dec->decoder_initialized = 1;
+    return 0;
+}
+
+static void destroy_decoder(DecoderContext *dec) {
+    if (!dec) return;
+    if (dec->extradata) free(dec->extradata);
+    if (dec->parser) av_parser_close(dec->parser);
+    if (dec->parser_ctx) {
+        if (dec->parser_ctx->extradata) av_free(dec->parser_ctx->extradata);
+        avcodec_free_context(&dec->parser_ctx);
+    }
+    if (dec->packet) mpp_packet_deinit(&dec->packet);
+    if (dec->frame) mpp_frame_deinit(&dec->frame);
+    if (dec->buf_mgr) dec_buf_mgr_deinit(dec->buf_mgr);
+    if (dec->ctx) mpp_destroy(dec->ctx);
+}
+
+// ---- 硬件解码核心 ----
+static void handle_info_change(DecoderContext *dec, MppFrame frame) {
+    RK_U32 w = mpp_frame_get_width(frame), h = mpp_frame_get_height(frame);
+    dec->width = w; dec->height = h;
+    dec->hor_stride = mpp_frame_get_hor_stride(frame);
+    dec->ver_stride = mpp_frame_get_ver_stride(frame);
+    dec->mpi->control(dec->ctx, MPP_DEC_SET_OUTPUT_FORMAT, &dec->output_format);
+    if (dec->buf_mgr) {
+        size_t buf_size = dec->hor_stride * dec->ver_stride * 3 / 2;
+        mpp_buffer_group_limit_config(dec->buf_mgr, buf_size * 24, 24);
+        dec->mpi->control(dec->ctx, MPP_DEC_SET_EXT_BUF_GROUP, dec->buf_mgr);
+    }
+    dec->mpi->control(dec->ctx, MPP_DEC_SET_INFO_CHANGE_READY, NULL);
+}
+
+static int decode_frame(DecoderContext *dec, uint8_t *data, size_t len,
+                        void **frame_data, int *frame_width, int *frame_height) {
+    if (!dec->decoder_initialized) return 0;
+
+    uint8_t *parse_data = data;
+    int parse_len = len, decoded = 0;
+
+    if (dec->parser) {
+        while (parse_len > 0) {
+            uint8_t *out_data = NULL;
+            int out_size = 0;
+            int consumed = av_parser_parse2(dec->parser, dec->parser_ctx, &out_data, &out_size,
+                                            parse_data, parse_len, AV_NOPTS_VALUE, AV_NOPTS_VALUE, 0);
+            if (consumed < 0) break;
+            parse_data += consumed;
+            parse_len -= consumed;
+            if (out_size > 0) {
+                if (dec->packet) mpp_packet_deinit(&dec->packet);
+                if (mpp_packet_init(&dec->packet, out_data, out_size) == MPP_OK) {
+                    dec->mpi->decode_put_packet(dec->ctx, dec->packet);
+                    decoded = 1;
+                }
+            }
+        }
+    }
+
+    if (!decoded) return 0;
+
+    if (dec->frame) { mpp_frame_deinit(&dec->frame); dec->frame = NULL; }
+    if (dec->mpi->decode_get_frame(dec->ctx, &dec->frame) != MPP_OK) return 0;
+    if (!dec->frame) return 0;
+
+    if (mpp_frame_get_info_change(dec->frame)) {
+        handle_info_change(dec, dec->frame);
+        return 0;
+    }
+
+    MppBuffer buffer = mpp_frame_get_buffer(dec->frame);
+    if (buffer) {
+        *frame_data = mpp_buffer_get_ptr(buffer);
+        *frame_width = mpp_frame_get_width(dec->frame);
+        *frame_height = mpp_frame_get_height(dec->frame);
+        return 1;
+    }
+    return 0;
+}
+
+// ---- NV12 → BGR ----
+static int nv12_to_bgr(MppFrame frame, DecoderContext *dec, cv::Mat &out) {
+    MppBuffer buffer = mpp_frame_get_buffer(frame);
+    if (!buffer) return -1;
+    void *data = mpp_buffer_get_ptr(buffer);
+    if (!data) return -1;
+
+    RK_U32 width = dec->width, height = dec->height;
+    RK_U32 hor_stride = dec->hor_stride ? dec->hor_stride : width;
+    RK_U32 ver_stride = dec->ver_stride ? dec->ver_stride : height;
+
+    cv::Mat nv12(ver_stride * 3 / 2, hor_stride, CV_8UC1, data);
+    static cv::Mat bgr;
+    if (bgr.empty() || bgr.cols != (int)width || bgr.rows != (int)height)
+        bgr.create(height, width, CV_8UC3);
+
+    cv::cvtColor(nv12, bgr, cv::COLOR_YUV2BGR_NV12);
+    out = (bgr.cols > (int)width || bgr.rows > (int)height) ? bgr(cv::Rect(0, 0, width, height)) : bgr;
+    return 0;
+}
+
+// ============================================================
+// 主函数：RTSP 硬解 + ROS 发布
+// ============================================================
+int main(int argc, char **argv) {
+    ros::init(argc, argv, "rtsp_hw_pub");
+    ros::NodeHandle nh("~");
+    ros::Publisher pub = nh.advertise<sensor_msgs::Image>("/rtsp_cam/image_raw", 1);
+    //ros::Rate rate(30);
+
+    std::string url = "rtsp://192.168.144.108";
+    nh.param<std::string>("rtsp_url", url, url);
+    if (argc > 1) url = argv[1]; // 命令行参数覆盖 ROS 参数
+
+    AVFormatContext *fmt_ctx = NULL;
+    AVPacket *pkt = av_packet_alloc();
+    DecoderContext dec;
+    cv::Mat frame;
+    int video_idx = -1;
+    AVDictionary *opts = NULL;
+
+    avformat_network_init();
+    fmt_ctx = avformat_alloc_context();
+    av_dict_set(&opts, "rtsp_transport", "tcp", 0);
+    av_dict_set(&opts, "max_delay", "50000", 0);
+    av_dict_set(&opts, "buffer_size", "512000", 0);
+    av_dict_set(&opts, "fflags", "nobuffer", 0);
+    av_dict_set(&opts, "flags", "low_delay", 0);
+
+    if (avformat_open_input(&fmt_ctx, url.c_str(), NULL, &opts) < 0) {
+        mpp_err("Failed to open RTSP stream\n");
+        return -1;
+    }
+    avformat_find_stream_info(fmt_ctx, NULL);
+
+    for (unsigned i = 0; i < fmt_ctx->nb_streams; i++) {
+        if (fmt_ctx->streams[i]->codecpar->codec_type == AVMEDIA_TYPE_VIDEO) {
+            video_idx = i;
+            break;
+        }
+    }
+    if (video_idx == -1) { mpp_err("No video stream\n"); return -1; }
+
+    AVCodecParameters *cp = fmt_ctx->streams[video_idx]->codecpar;
+    MppCodingType type = (cp->codec_id == AV_CODEC_ID_H265) ? MPP_VIDEO_CodingHEVC : MPP_VIDEO_CodingAVC;
+
+    if (init_decoder(&dec, type, cp->width, cp->height, cp->extradata, cp->extradata_size)) {
+        mpp_err("Decoder init failed\n");
+        return -1;
+    }
+    send_extradata_to_decoder(&dec);
+
+    ROS_INFO("rtsp_hw_pub_ultra running ...");
+
+    while (ros::ok()) {
+        if (av_read_frame(fmt_ctx, pkt) < 0) { usleep(10000); continue; }
+        if (pkt->stream_index == video_idx) {
+            void *data = NULL;
+            int fw = 0, fh = 0;
+            if (decode_frame(&dec, pkt->data, pkt->size, &data, &fw, &fh) == 1 && dec.frame) {
+                if (nv12_to_bgr(dec.frame, &dec, frame) == 0 && !frame.empty()) {
+                    sensor_msgs::ImagePtr msg = cv_bridge::CvImage(std_msgs::Header(), "bgr8", frame).toImageMsg();
+                    pub.publish(msg);
+                }
+                mpp_frame_deinit(&dec.frame);
+                dec.frame = NULL;
+            }
+        }
+        av_packet_unref(pkt);
+        ros::spinOnce();
+        //rate.sleep();
+    }
+
+    avformat_close_input(&fmt_ctx);
+    av_packet_free(&pkt);
+    destroy_decoder(&dec);
+    avformat_network_deinit();
+    return 0;
+}

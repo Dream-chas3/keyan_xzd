@@ -1,0 +1,20 @@
+<launch>
+  <arg name="mission_file" default="$(find waypoint_mission)/missions/abc_photo.yaml"/>
+  <arg name="dry_run" default="false"/>
+  <arg name="bench_mode" default="false"/>
+  <arg name="start_camera" default="true"/>
+
+  <!-- 云台相机：RK3588 硬件解码，发布 /rtsp_cam/image_raw (1920x1080) -->
+  <group if="$(arg start_camera)">
+    <include file="$(find rtsp_test)/launch/rtsp_test.launch"/>
+    <node pkg="waypoint_mission" type="waypoint_photo" name="waypoint_photo" output="screen"/>
+  </group>
+
+  <!-- 航点任务节点。启动后处于 IDLE，不会解锁/切模式/发设定点，
+       必须等遥控器从定点档拨到 Offboard 档(demo 任务的 RC 启动门)。 -->
+  <node pkg="waypoint_mission" type="waypoint_mission" name="waypoint_mission" output="screen">
+    <param name="mission_file" value="$(arg mission_file)"/>
+    <param name="dry_run" value="$(arg dry_run)" type="bool"/>
+    <param name="bench_mode" value="$(arg bench_mode)" type="bool"/>
+  </node>
+</launch>

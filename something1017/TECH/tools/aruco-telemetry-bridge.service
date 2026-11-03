@@ -1,0 +1,15 @@
+[Unit]
+Description=Read-only compact telemetry for ArUco desktop station
+After=network.target
+
+[Service]
+Type=simple
+User=orangepi
+ExecStart=/bin/bash /home/orangepi/something1017/TECH/tools/run_aruco_telemetry.sh
+Restart=on-failure
+RestartSec=5
+Nice=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

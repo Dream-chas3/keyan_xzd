@@ -1,0 +1,517 @@
+#include "land_test/Safina_land_test.h"
+#include <ros/master.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <ctime>
+#include <cstdlib>
+#include <cerrno>
+#include <iomanip>
+#include <sstream>
+#include <stdexcept>
+#include <utility>
+
+namespace {
+double steady() { return ros::SteadyTime::now().toSec(); }
+bool recent(double then,double now,double timeout) { return then>=0 && now>=then && now-then<=timeout; }
+bool validQuaternion(const geometry_msgs::Quaternion& q) {
+    double n=q.x*q.x+q.y*q.y+q.z*q.z+q.w*q.w;
+    return std::isfinite(n) && n>0.8*0.8 && n<1.2*1.2;
+}
+double yawOf(const geometry_msgs::Quaternion& q) {
+    tf2::Quaternion quat(q.x,q.y,q.z,q.w);quat.normalize();
+    double r,p,y;tf2::Matrix3x3(quat).getRPY(r,p,y);return y;
+}
+bool finitePosition(const geometry_msgs::Point& p) {
+    return std::isfinite(p.x)&&std::isfinite(p.y)&&std::isfinite(p.z);
+}
+bool competingPublisher(std::string& reason) {
+    XmlRpc::XmlRpcValue args,result,payload;
+    args[0]=ros::this_node::getName();
+    if (!ros::master::execute("getSystemState",args,result,payload,false)) {
+        reason="cannot_check_control_publishers";return true;
+    }
+    for (int i=0;i<payload[0].size();++i) {
+        const std::string topic=payload[0][i][0];
+        if (topic!="/mavros/setpoint_raw/local" && topic!="/mavros/setpoint_position/local" &&
+            topic!="/mavros/setpoint_raw/attitude" && topic!="/mavros/setpoint_velocity/cmd_vel") continue;
+        for (int j=0;j<payload[0][i][1].size();++j) {
+            const std::string publisher=payload[0][i][1][j];
+            if (publisher!=ros::this_node::getName()) {
+                reason="competing_controller:"+publisher+":"+topic;return true;
+            }
+        }
+    }
+    return false;
+}
+}
+
+Safina_land::Safina_land(ros::NodeHandle node) : node_(node) {
+    loadParameters();task_.reset(new land_task::Task(config_));rc_gate_.config=rc_config_;openDiagnostics();
+    command_pub_=node_.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local",1);
+    diagnostic_pub_=node_.advertise<std_msgs::String>("/aruco_landing/status",1,true);
+    header_pub_=node_.advertise<std_msgs::String>("/aruco_landing/status_header",1,true);
+    std_msgs::String schema;schema.data=diagnostic_header_;header_pub_.publish(schema);
+    goal_pub_=node_.advertise<geometry_msgs::PoseStamped>("/aruco_landing/active_goal",1);
+    target_pub_=node_.advertise<geometry_msgs::PoseStamped>("/aruco_landing/accepted_target",1);
+    path_pub_=node_.advertise<nav_msgs::Path>("/aruco_landing/guidance_path",1);
+    state_sub_=node_.subscribe("/mavros/state",10,&Safina_land::stateCallback,this);
+    pose_sub_=node_.subscribe("/mavros/local_position/pose",10,&Safina_land::poseCallback,this);
+    velocity_sub_=node_.subscribe("/mavros/local_position/velocity_local",10,&Safina_land::velocityCallback,this);
+    extended_sub_=node_.subscribe("/mavros/extended_state",10,&Safina_land::extendedCallback,this);
+    marker_sub_=node_.subscribe("/aruco_poseresult",1,&Safina_land::markerCallback,this);
+    rc_sub_=node_.subscribe("/mavros/rc/in",10,&Safina_land::rcCallback,this);
+    mode_client_=node_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
+    arm_client_=node_.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
+    enable_service_=node_.advertiseService("/aruco_landing/enable",&Safina_land::enable,this);
+    worker_=std::thread(&Safina_land::workerLoop,this);
+    if(command_gimbal_down_&&gimbal_down_on_startup_) {
+        std::lock_guard<std::mutex> lock(mutex_);
+        job_="gimbal_startup";job_generation_=generation_;pending_=true;gimbal_status_="startup_pending";jobs_.notify_one();
+    }
+    timer_=node_.createWallTimer(ros::WallDuration(1.0/30.0),&Safina_land::tick,this);
+    ROS_WARN("ArUco landing v2: WAITING. Startup sends no flight setpoints, arming or mode requests. "
+             "Trigger=%s auto_takeoff=%s. Camera startup-down=%s. For RC trigger, first select a non-OFFBOARD position then switch into OFFBOARD. Diagnostics: %s",
+             start_trigger_.c_str(),config_.auto_takeoff?"true":"false",
+             (command_gimbal_down_&&gimbal_down_on_startup_)?"true":"false",diagnostic_path_.c_str());
+}
+
+Safina_land::~Safina_land() {
+    timer_.stop();
+    {std::lock_guard<std::mutex> lock(mutex_);stopping_=true;pending_=false;++generation_;}
+    jobs_.notify_all();
+    if(worker_.joinable())worker_.join();
+    // Destruction must never change flight mode or re-arm the aircraft.
+    if(diagnostic_file_)diagnostic_file_.flush();
+}
+
+void Safina_land::loadParameters() {
+    ros::NodeHandle p("/aruco_landing");
+    auto positive=[&](const char* key,double& value) {
+        p.param(key,value,value);
+        if(!std::isfinite(value)||value<=0)throw std::runtime_error(std::string("Invalid positive parameter: ")+key);
+    };
+    node_.param("takeOff_altitude",config_.takeoff_altitude,config_.takeoff_altitude);
+    p.param("auto_takeoff",config_.auto_takeoff,config_.auto_takeoff);
+    p.param("start_trigger",start_trigger_,start_trigger_);
+    p.param("rc_ready_mode",rc_ready_mode_,rc_ready_mode_);
+    p.param("rc_channel",rc_config_.channel,rc_config_.channel);
+    p.param("rc_offboard_slot",rc_config_.offboard_slot,rc_config_.offboard_slot);
+    p.param("rc_min",rc_config_.minimum,rc_config_.minimum);
+    p.param("rc_trim",rc_config_.trim,rc_config_.trim);
+    p.param("rc_max",rc_config_.maximum,rc_config_.maximum);
+    p.param("rc_deadzone",rc_config_.deadzone,rc_config_.deadzone);
+    p.param("rc_reversed",rc_config_.reversed,rc_config_.reversed);
+    p.param("rc_timeout",rc_config_.timeout,rc_config_.timeout);
+    p.param("rc_off_hold_seconds",rc_config_.off_hold_seconds,rc_config_.off_hold_seconds);
+    p.param("rc_on_hold_seconds",rc_config_.on_hold_seconds,rc_config_.on_hold_seconds);
+    if((start_trigger_!="service"&&start_trigger_!="rc_offboard")||!rc_config_.valid())
+        throw std::runtime_error("Invalid start trigger or RC mode switch calibration");
+    p.param("align_yaw",config_.align_yaw,config_.align_yaw);
+    p.param("soft_yaw_enabled",config_.soft_yaw_enabled,config_.soft_yaw_enabled);
+    p.param("soft_yaw_to_top_edge",config_.soft_yaw_to_top_edge,config_.soft_yaw_to_top_edge);
+    p.param("soft_yaw_approach",config_.soft_yaw_approach,config_.soft_yaw_approach);
+    positive("soft_yaw_kp",config_.soft_yaw_kp);
+    positive("soft_yaw_max_rate",config_.soft_yaw_max_rate);
+    p.param("soft_yaw_deadband",config_.soft_yaw_deadband,config_.soft_yaw_deadband);
+    if(!std::isfinite(config_.soft_yaw_deadband)||config_.soft_yaw_deadband<0)
+        throw std::runtime_error("Invalid soft yaw deadband");
+    p.param("xy_kd",config_.xy_kd,config_.xy_kd);
+    p.param("z_kd",config_.z_kd,config_.z_kd);
+    p.param("xy_ki",config_.xy_ki,config_.xy_ki);
+    p.param("z_ki",config_.z_ki,config_.z_ki);
+    positive("xy_integral_limit",config_.xy_integral_limit);
+    positive("z_integral_limit",config_.z_integral_limit);
+    p.param("terminal_descent_enabled",config_.terminal_descent_enabled,config_.terminal_descent_enabled);
+    positive("terminal_marker_depth",config_.terminal_marker_depth);
+    positive("terminal_height",config_.terminal_height);
+    positive("terminal_align_error",config_.terminal_align_error);
+    positive("terminal_align_confirm_seconds",config_.terminal_align_confirm_seconds);
+    positive("terminal_align_timeout",config_.terminal_align_timeout);
+    p.param("terminal_heading_hold",config_.terminal_heading_hold,config_.terminal_heading_hold);
+    positive("terminal_heading_kp",config_.terminal_heading_kp);
+    positive("terminal_heading_max_rate",config_.terminal_heading_max_rate);
+    positive("terminal_hold_kp",config_.terminal_hold_kp);
+    p.param("terminal_hold_kd",config_.terminal_hold_kd,config_.terminal_hold_kd);
+    p.param("terminal_hold_ki",config_.terminal_hold_ki,config_.terminal_hold_ki);
+    positive("terminal_integral_limit",config_.terminal_integral_limit);
+    positive("terminal_slow_height",config_.terminal_slow_height);
+    positive("terminal_slow_speed",config_.terminal_slow_speed);
+    positive("terminal_hold_speed",config_.terminal_hold_speed);
+    positive("terminal_land_height",config_.terminal_land_height);
+    positive("terminal_center_error",config_.terminal_center_error);
+    positive("terminal_descent_speed",config_.terminal_descent_speed);
+    positive("terminal_max_descent",config_.terminal_max_descent);
+    positive("terminal_timeout",config_.terminal_timeout);
+    positive("terminal_max_drift",config_.terminal_max_drift);
+    positive("terminal_confirm_seconds",config_.terminal_confirm_seconds);
+    positive("terminal_loss_depth",config_.terminal_loss_depth);
+    positive("terminal_loss_error",config_.terminal_loss_error);
+    p.param("image_latency_seconds",image_latency_,image_latency_);
+    if(!std::isfinite(image_latency_)||image_latency_<0||image_latency_>1.0)
+        throw std::runtime_error("Invalid image latency compensation");
+    p.param("short_loss_enabled",config_.short_loss_enabled,config_.short_loss_enabled);
+    positive("short_loss_seconds",config_.short_loss_seconds);positive("short_loss_speed",config_.short_loss_speed);
+    positive("short_loss_max_travel",config_.short_loss_max_travel);positive("reacquire_seconds",config_.reacquire_seconds);
+    positive("takeoff_speed",config_.takeoff_speed);positive("takeoff_kp",config_.takeoff_kp);
+    positive("hover_seconds",config_.hover_seconds);positive("xy_kp",config_.xy_kp);
+    positive("descend_xy_gain_height",config_.descend_xy_gain_height);
+    positive("descend_xy_kp",config_.descend_xy_kp);
+    positive("takeoff_xy_tolerance",config_.takeoff_xy_tolerance);
+    positive("takeoff_z_tolerance",config_.takeoff_z_tolerance);
+    positive("takeoff_stable_xy_speed",config_.takeoff_stable_xy_speed);
+    positive("takeoff_stable_z_speed",config_.takeoff_stable_z_speed);
+    positive("takeoff_stable_yaw_rate",config_.takeoff_stable_yaw_rate);
+    positive("z_kp",config_.z_kp);positive("yaw_kp",config_.yaw_kp);
+    positive("descent_speed",config_.descent_speed);positive("max_xy_speed",config_.max_xy_speed);
+    positive("max_z_speed",config_.max_z_speed);positive("max_yaw_rate",config_.max_yaw_rate);
+    positive("yaw_hold_speed",config_.yaw_hold_speed);positive("yaw_hold_kp",config_.yaw_hold_kp);
+    positive("max_xy_accel",config_.max_xy_accel);positive("max_z_accel",config_.max_z_accel);
+    positive("max_yaw_accel",config_.max_yaw_accel);positive("yaw_start_error",config_.yaw_start_error);
+    positive("yaw_exit_error",config_.yaw_exit_error);positive("align_enter_error",config_.align_enter_error);
+    positive("align_exit_error",config_.align_exit_error);positive("yaw_tolerance",config_.yaw_tolerance);
+    positive("yaw_exit_tolerance",config_.yaw_exit_tolerance);positive("stable_seconds",config_.stable_seconds);
+    positive("stable_xy_speed",config_.stable_xy_speed);positive("stable_z_speed",config_.stable_z_speed);
+    positive("stable_yaw_rate",config_.stable_yaw_rate);positive("target_confirm_seconds",config_.target_confirm_seconds);
+    positive("target_timeout",config_.target_timeout);positive("initial_target_timeout",config_.initial_target_timeout);
+    positive("final_marker_distance",config_.final_marker_distance);positive("final_confirm_seconds",config_.final_confirm_seconds);
+    positive("near_ground_loss_seconds",config_.near_ground_loss_seconds);positive("prestream_seconds",config_.prestream_seconds);
+    positive("takeover_timeout",config_.takeover_timeout);positive("handoff_timeout",config_.handoff_timeout);
+    positive("retry_seconds",config_.retry_seconds);positive("max_tick_gap",config_.max_tick_gap);
+    positive("state_timeout",state_timeout_);positive("pose_timeout",pose_timeout_);
+    positive("velocity_timeout",velocity_timeout_);positive("extended_timeout",extended_timeout_);
+    positive("source_stamp_timeout",source_stamp_timeout_);positive("pose_image_tolerance",pose_image_tolerance_);
+    positive("target_alpha",target_alpha_);positive("max_marker_range",max_marker_range_);
+    positive("max_target_jump",max_target_jump_);positive("diagnostic_hz",diagnostic_hz_);
+    p.param("camera_offset_x",camera_offset_x_,camera_offset_x_);
+    p.param("camera_offset_y",camera_offset_y_,camera_offset_y_);
+    p.param("camera_offset_z",camera_offset_z_,camera_offset_z_);
+    p.param("command_gimbal_down",command_gimbal_down_,command_gimbal_down_);
+    p.param("gimbal_down_on_startup",gimbal_down_on_startup_,gimbal_down_on_startup_);
+    p.param("gimbal_ip",gimbal_ip_,gimbal_ip_);p.param("gimbal_port",gimbal_port_,gimbal_port_);
+    p.param<std::string>("diagnostic_directory",diagnostic_path_,"");
+    std::string error;
+    if(!config_.valid(error))throw std::runtime_error(error);
+    if(target_alpha_>1||diagnostic_hz_>30||gimbal_port_<=0||gimbal_port_>65535||
+       !std::isfinite(camera_offset_x_)||!std::isfinite(camera_offset_y_)||!std::isfinite(camera_offset_z_))
+        throw std::runtime_error("Invalid filter, diagnostics, camera offset or gimbal parameter");
+}
+
+void Safina_land::openDiagnostics() {
+    if(diagnostic_path_.empty()) {
+        const char* home=std::getenv("HOME");
+        diagnostic_path_=std::string(home?home:"/tmp")+"/.ros/aruco_landing";
+    }
+    if(::mkdir(diagnostic_path_.c_str(),0755)!=0 && errno!=EEXIST)
+        throw std::runtime_error("Cannot create diagnostics directory: "+diagnostic_path_);
+    std::time_t now=std::time(nullptr);char date[32];std::strftime(date,sizeof(date),"%Y%m%d_%H%M%S",std::localtime(&now));
+    diagnostic_path_+="/landing_"+std::string(date)+"_"+std::to_string(::getpid())+".csv";
+    diagnostic_file_.open(diagnostic_path_);
+    if(!diagnostic_file_)throw std::runtime_error("Cannot open diagnostic CSV");
+    diagnostic_file_<<"# auto_takeoff="<<config_.auto_takeoff<<",takeoff_altitude="<<config_.takeoff_altitude
+        <<",max_xy_speed="<<config_.max_xy_speed<<",descent_speed="<<config_.descent_speed
+        <<",max_yaw_rate="<<config_.max_yaw_rate<<",max_xy_accel="<<config_.max_xy_accel
+        <<",max_z_accel="<<config_.max_z_accel<<",max_yaw_accel="<<config_.max_yaw_accel
+        <<",takeoff_speed="<<config_.takeoff_speed<<",takeoff_xy_tolerance="<<config_.takeoff_xy_tolerance
+        <<",takeoff_z_tolerance="<<config_.takeoff_z_tolerance
+        <<",takeoff_stable_xy_speed="<<config_.takeoff_stable_xy_speed
+        <<",takeoff_stable_z_speed="<<config_.takeoff_stable_z_speed
+        <<",takeoff_stable_yaw_rate="<<config_.takeoff_stable_yaw_rate<<"\n";
+    diagnostic_header_="ros_time,steady_time,phase,reason,enabled,mode,armed,x,y,z,yaw,vx,vy,vz,yaw_rate,"
+        "target_valid,target_age,target_x,target_y,xy_error,marker_yaw,marker_depth,desired_vx,desired_vy,"
+        "desired_vz,desired_yaw_rate,cmd_vx,cmd_vy,cmd_vz,cmd_yaw_rate,published,planned_descent,"
+        "request_offboard,request_arm,request_land,search_elapsed,rc_valid,rc_slot,rc_offboard_selected,rc_edge_ready,"
+        "takeoff_xy_error,takeoff_z_error,takeoff_failed_gates,takeoff_hold_seconds,"
+        "marker_reason,marker_source_age,marker_pair_dt,marker_jump,marker_received,marker_accepted,"
+        "target_z,goal_x,goal_y,goal_z,goal_valid,marker_rx_age,gimbal_ready,gimbal_status,inherit_age,inherit_travel,yaw_hold_active,descent_failed_gates,alignment_hold_seconds";
+    diagnostic_file_<<diagnostic_header_<<'\n';
+    diagnostic_file_.flush();
+}
+
+land_task::Input Safina_land::input(double now) const {
+    land_task::Input i;i.now=now;
+    i.state_ok=recent(state_at_,now,state_timeout_);i.pose_ok=pose_valid_&&recent(pose_at_,now,pose_timeout_);
+    i.velocity_ok=velocity_valid_&&recent(velocity_at_,now,velocity_timeout_);
+    i.extended_ok=recent(extended_at_,now,extended_timeout_);i.connected=state_.connected;
+    i.armed=state_.armed;i.mode=state_.mode;i.landed_state=extended_.landed_state;
+    i.x=pose_.pose.position.x;i.y=pose_.pose.position.y;i.z=pose_.pose.position.z;i.yaw=yaw_;
+    i.vx=velocity_.twist.linear.x;i.vy=velocity_.twist.linear.y;i.vz=velocity_.twist.linear.z;i.yaw_rate=yaw_rate_;
+    i.target_valid=marker_valid_&&recent(marker_rx_at_,now,config_.target_timeout);
+    i.target_time=marker_valid_at_;i.target_x=target_x_;i.target_y=target_y_;
+    i.target_body_x=target_body_x_;i.target_body_y=target_body_y_;
+    i.target_yaw=marker_yaw_;i.target_distance=marker_distance_;
+    i.gimbal_ready=!command_gimbal_down_||gimbal_ready_;
+    return i;
+}
+
+void Safina_land::stateCallback(const mavros_msgs::State::ConstPtr& m) {
+    std::lock_guard<std::mutex> lock(mutex_);state_=*m;state_at_=steady();
+    if(task_->active()&&task_->offboardSeen()&&m->mode!="OFFBOARD" &&
+       !(task_->phase()==land_task::Phase::LAND_HANDOFF&&task_->landRequested()&&m->mode=="AUTO.LAND") &&
+       !(task_->phase()==land_task::Phase::AUTO_LAND&&m->mode=="AUTO.LAND")) {
+        task_->cancel("pilot_or_fcu_left_offboard");pending_=false;++generation_;
+    }
+}
+void Safina_land::extendedCallback(const mavros_msgs::ExtendedState::ConstPtr& m) {
+    std::lock_guard<std::mutex> lock(mutex_);extended_=*m;extended_at_=steady();
+}
+void Safina_land::rcCallback(const mavros_msgs::RCIn::ConstPtr& m) {
+    std::lock_guard<std::mutex> lock(mutex_);rc_at_=steady();
+    const double age=(ros::Time::now()-m->header.stamp).toSec();
+    rc_slot_=m->channels.size()>=size_t(rc_config_.channel)?rc_config_.slot(m->channels[rc_config_.channel-1]):0;
+    rc_valid_=rc_slot_!=0&&m->rssi!=0&&!m->header.stamp.isZero()&&age>=-0.1&&age<=rc_config_.timeout;
+    rc_selected_=rc_slot_==rc_config_.offboard_slot;
+    if(start_trigger_=="rc_offboard"&&task_->active()&&(!rc_valid_||!rc_selected_)){
+        task_->cancel("rc_switch_out_or_invalid");pending_=false;++generation_;
+    }
+}
+void Safina_land::poseCallback(const geometry_msgs::PoseStamped::ConstPtr& m) {
+    std::lock_guard<std::mutex> lock(mutex_);const double now=steady();
+    pose_=*m;pose_at_=now;pose_valid_=finitePosition(m->pose.position)&&validQuaternion(m->pose.orientation);
+    const double age=(ros::Time::now()-m->header.stamp).toSec();
+    pose_valid_=pose_valid_&&!m->header.stamp.isZero()&&age>=-0.1&&age<=source_stamp_timeout_;
+    if(!pose_valid_)return;
+    yaw_=yawOf(m->pose.orientation);
+    const double source_time=m->header.stamp.toSec();
+    if(last_pose_time_>=0&&source_time>last_pose_time_)
+        yaw_rate_=land_task::angle(yaw_-last_pose_yaw_)/(source_time-last_pose_time_);
+    last_pose_yaw_=yaw_;last_pose_time_=source_time;
+    poses_.push_back({*m,now});while(poses_.size()>90)poses_.pop_front();
+}
+void Safina_land::velocityCallback(const geometry_msgs::TwistStamped::ConstPtr& m) {
+    std::lock_guard<std::mutex> lock(mutex_);velocity_=*m;velocity_at_=steady();
+    const auto& v=m->twist.linear;
+    const double age=(ros::Time::now()-m->header.stamp).toSec();
+    velocity_valid_=std::isfinite(v.x)&&std::isfinite(v.y)&&std::isfinite(v.z)&&
+        !m->header.stamp.isZero()&&age>=-0.1&&age<=source_stamp_timeout_;
+}
+void Safina_land::markerCallback(const geometry_msgs::PoseStamped::ConstPtr& m) {
+    std::lock_guard<std::mutex> lock(mutex_);const double now=steady();marker_rx_at_=now;
+    marker_valid_=false;++marker_received_;marker_pair_dt_=-1;marker_jump_=0;
+    const auto& p=m->pose.position;
+    const double age=(ros::Time::now()-m->header.stamp).toSec();marker_source_age_=age;
+    if(!finitePosition(p)||p.z<=0)marker_reason_="detector_no_selected_target";
+    else if(p.z>max_marker_range_)marker_reason_="marker_out_of_range";
+    else if(!validQuaternion(m->pose.orientation))marker_reason_="invalid_marker_quaternion";
+    else if(m->header.stamp.isZero())marker_reason_="missing_source_stamp";
+    else if(age< -0.1||age>source_stamp_timeout_)marker_reason_="source_stamp_stale";
+    else if(!pose_valid_||!recent(pose_at_,now,pose_timeout_))marker_reason_="local_pose_unavailable";
+    else marker_reason_="pairing";
+    if(marker_reason_!="pairing") {
+        if(!recent(marker_valid_at_,now,std::max(config_.target_timeout,config_.short_loss_seconds)))target_filter_ready_=false;return;
+    }
+    // The image has no capture stamp: the detector substitutes its receipt
+    // time. Pair the optical pose with the aircraft pose from image_latency_
+    // seconds earlier so motion during the capture/transport delay does not
+    // shift the world target (v * latency bias).
+    ros::Time pair_stamp=m->header.stamp;
+    if(image_latency_>0) pair_stamp-=ros::Duration(image_latency_);
+    auto find_pair=[&](const ros::Time& target) {
+        const TimedPose* best=nullptr;double best_delta=pose_image_tolerance_;
+        for(const auto& pose:poses_) {
+            const double d=std::fabs((pose.message.header.stamp-target).toSec());
+            if(d<=best_delta) {best_delta=d;best=&pose;}
+        }
+        return std::make_pair(best,best_delta);
+    };
+    auto found_pair=find_pair(pair_stamp);
+    if(!found_pair.first&&image_latency_>0) found_pair=find_pair(m->header.stamp);
+    const TimedPose* paired=found_pair.first;double delta=found_pair.second;
+    if(!paired){marker_reason_="pose_image_not_synchronized";
+        if(!recent(marker_valid_at_,now,std::max(config_.target_timeout,config_.short_loss_seconds)))target_filter_ready_=false;return;
+    }
+    marker_pair_dt_=delta;
+    const double y=yawOf(paired->message.pose.orientation),cy=std::cos(y),sy=std::sin(y);
+    // The approach drives the camera axis onto the marker: the body-centre
+    // offset is deliberately NOT included here. It is added to target_body_*
+    // and used only after the close-range hover, just before the blind descent.
+    const double bx=-p.y,by=-p.x;
+    const double tx=paired->message.pose.position.x+cy*bx-sy*by;
+    const double ty=paired->message.pose.position.y+sy*bx+cy*by;
+    marker_jump_=std::hypot(tx-target_x_,ty-target_y_);
+    if(target_filter_ready_&&recent(marker_valid_at_,now,std::max(config_.target_timeout,config_.short_loss_seconds))&&
+       marker_jump_>max_target_jump_){marker_reason_="target_jump_rejected";return;}
+    if(!target_filter_ready_||!recent(marker_valid_at_,now,std::max(config_.target_timeout,config_.short_loss_seconds))) {target_x_=tx;target_y_=ty;}
+    else {target_x_+=target_alpha_*(tx-target_x_);target_y_+=target_alpha_*(ty-target_y_);}
+    // Body-centre target = camera target + body-frame camera offset, rotated by
+    // the aircraft yaw at image time. Used only by the terminal offset stage.
+    target_body_x_=target_x_+cy*camera_offset_x_-sy*camera_offset_y_;
+    target_body_y_=target_y_+sy*camera_offset_x_+cy*camera_offset_y_;
+    target_filter_ready_=true;marker_valid_=true;marker_valid_at_=now;
+    marker_distance_=p.z-camera_offset_z_;
+    target_z_=paired->message.pose.position.z-marker_distance_;
+    marker_reason_="accepted";++marker_accepted_;
+    marker_yaw_=land_task::angle(yawOf(m->pose.orientation)+land_task::angle(yaw_-y));
+}
+
+bool Safina_land::enable(std_srvs::SetBool::Request& request,std_srvs::SetBool::Response& response) {
+    if(request.data&&start_trigger_=="rc_offboard") {
+        response.success=false;response.message="RC trigger selected: use the transmitter OFFBOARD switch, no service enable needed";
+        return true;
+    }
+    if(request.data) {
+        std::string conflict;
+        if(competingPublisher(conflict)) {response.success=false;response.message=conflict;return true;}
+    }
+    std::lock_guard<std::mutex> lock(mutex_);
+    if(!request.data) {
+        task_->cancel("explicit_disable");pending_=false;++generation_;
+        response.success=true;response.message="Task cancelled; no mode is reclaimed. Select pilot mode if still OFFBOARD.";
+        return true;
+    }
+    std::string reason;response.success=startTask(steady(),reason);response.message=reason;
+    return true;
+}
+
+// Caller holds mutex; publisher-conflict check is done before entering here.
+bool Safina_land::startTask(double now,std::string& reason) {
+    if(worker_busy_||pending_) {reason="previous_async_job_still_running";return false;}
+    if(!task_->enable(input(now),reason))return false;
+    ++generation_;pending_=false;gimbal_ready_=!command_gimbal_down_;
+    if(command_gimbal_down_){gimbal_status_="task_down_pending";queueJob("gimbal_down",now);}
+    ROS_WARN("Landing task enabled by %s; generation=%lu auto_takeoff=%d",start_trigger_.c_str(),generation_,config_.auto_takeoff);
+    return true;
+}
+
+void Safina_land::queueJob(const std::string& kind,double) {
+    if(pending_||worker_busy_||!task_->active())return;
+    job_=kind;job_generation_=generation_;job_mode_=state_.mode;pending_=true;jobs_.notify_one();
+}
+void Safina_land::workerLoop() {
+    for(;;) {
+        std::unique_lock<std::mutex> lock(mutex_);
+        jobs_.wait(lock,[this]{return stopping_||pending_;});if(stopping_)return;
+        const std::string kind=job_,expected_mode=job_mode_;const auto generation=job_generation_;
+        pending_=false;
+        // Explicit camera-only startup exception. It cannot call any FCU service,
+        // publish flight setpoints, or enable the task. All flight jobs below
+        // retain their original task/RC/state/generation guards.
+        if(kind=="gimbal_startup") {
+            if(!command_gimbal_down_||!gimbal_down_on_startup_)continue;
+            worker_busy_=true;gimbal_status_="startup_down_running";lock.unlock();bool ok=false;
+            gcu_handle_t* handle=gcu_connect(gimbal_ip_.c_str(),gimbal_port_);
+            if(handle){ok=gcu_set_angle(handle,0,-90,0)==0;gcu_disconnect(handle);}
+            lock.lock();worker_busy_=false;gimbal_ready_=ok;
+            gimbal_status_=ok?"startup_down_acknowledged":"startup_down_failed";
+            ROS_WARN("Camera startup-down acknowledged=%d; landing task remains disabled until RC trigger",ok);
+            continue;
+        }
+        if(generation!=generation_||!task_->active()||!recent(state_at_,steady(),state_timeout_)||
+           !state_.connected||state_.mode!=expected_mode)continue;
+        if(start_trigger_=="rc_offboard"&&(!rc_valid_||!rc_selected_||!recent(rc_at_,steady(),rc_config_.timeout)))continue;
+        if(kind=="offboard"&&task_->phase()!=land_task::Phase::PRESTREAM)continue;
+        if(kind=="arm"&&(!config_.auto_takeoff||task_->phase()!=land_task::Phase::PRESTREAM||state_.mode!="OFFBOARD"))continue;
+        if(kind=="land"&&task_->phase()!=land_task::Phase::LAND_HANDOFF)continue;
+        worker_busy_=true;lock.unlock();bool ok=false;
+        if(kind=="gimbal_down") {
+            gcu_handle_t* handle=gcu_connect(gimbal_ip_.c_str(),gimbal_port_);
+            if(handle){ok=gcu_set_angle(handle,0,-90,0)==0;gcu_disconnect(handle);}
+        } else if(kind=="arm") {
+            mavros_msgs::CommandBool call;call.request.value=true;
+            ok=arm_client_.call(call)&&call.response.success;
+        } else {
+            mavros_msgs::SetMode call;call.request.custom_mode=kind=="offboard"?"OFFBOARD":"AUTO.LAND";
+            ok=mode_client_.call(call)&&call.response.mode_sent;
+        }
+        lock.lock();worker_busy_=false;
+        if(kind=="gimbal_down"&&generation==generation_&&task_->active()) {
+            gimbal_status_=ok?"task_down_acknowledged":"task_down_failed";
+            if(ok)gimbal_ready_=true;
+            else {task_->cancel("gimbal_setup_failed");++generation_;pending_=false;}
+        }
+        ROS_INFO("Landing async request=%s accepted=%d generation=%lu current=%lu",kind.c_str(),ok,generation,generation_);
+    }
+}
+
+void Safina_land::tick(const ros::WallTimerEvent&) {
+    std::lock_guard<std::mutex> lock(mutex_);const double now=steady();
+    if(start_trigger_=="rc_offboard") {
+        const bool valid=rc_valid_&&recent(rc_at_,now,rc_config_.timeout);
+        const bool before_ready=rc_gate_.ready();
+        const bool baseline_ok=rc_selected_||task_->active()||
+            (recent(state_at_,now,state_timeout_)&&state_.mode==rc_ready_mode_);
+        const auto event=rc_gate_.update(now,valid&&baseline_ok,rc_selected_,task_->active());
+        if(!before_ready&&rc_gate_.ready())
+            ROS_WARN("RC gate READY in %s: switch to OFFBOARD for %s",rc_ready_mode_.c_str(),
+                config_.auto_takeoff?"autonomous takeoff and landing":"airborne landing takeover");
+        if(event==land_task::RcEvent::CANCEL) {
+            task_->cancel("rc_signal_timeout_or_switch_out");pending_=false;++generation_;
+        } else if(event==land_task::RcEvent::START) {
+            std::string reason;
+            if(competingPublisher(reason)||!startTask(now,reason))
+                ROS_WARN("RC OFFBOARD start rejected: %s; switch out then in to retry",reason.c_str());
+        }
+    }
+    const auto i=input(now);const auto out=task_->step(i);
+    if(!task_->active())pending_=false;
+    if(out.publish) {
+        mavros_msgs::PositionTarget cmd;cmd.header.stamp=ros::Time::now();cmd.header.frame_id="map";
+        cmd.coordinate_frame=mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
+        cmd.type_mask=mavros_msgs::PositionTarget::IGNORE_PX|mavros_msgs::PositionTarget::IGNORE_PY|
+            mavros_msgs::PositionTarget::IGNORE_PZ|mavros_msgs::PositionTarget::IGNORE_AFX|
+            mavros_msgs::PositionTarget::IGNORE_AFY|mavros_msgs::PositionTarget::IGNORE_AFZ|
+            mavros_msgs::PositionTarget::IGNORE_YAW;
+        // MAVROS transforms ROS ENU to the FCU NED convention.
+        cmd.velocity.x=out.velocity.x;cmd.velocity.y=out.velocity.y;cmd.velocity.z=out.velocity.z;
+        cmd.yaw_rate=out.yaw_rate;command_pub_.publish(cmd);
+    }
+    if(out.request_offboard)queueJob("offboard",i.now);
+    if(out.request_arm)queueJob("arm",i.now);
+    if(out.request_land)queueJob("land",i.now);
+    if(out.phase!=last_phase_) {
+        ROS_WARN("Landing phase %s -> %s reason=%s",land_task::name(last_phase_),land_task::name(out.phase),task_->reason().c_str());
+        last_phase_=out.phase;last_diagnostic_=-1;
+    }
+    if(out.phase==land_task::Phase::TAKEOFF) {
+        ROS_INFO_THROTTLE(3,"Takeoff readiness: XY %.3f/%.3f m, Z %.3f/%.3f m, "
+            "Vxy %.3f/%.3f m/s, Vz %.3f/%.3f m/s, yaw-rate %.3f/%.3f rad/s, hold %.2f/%.2f s, failed=%u",
+            task_->takeoffXYError(i),config_.takeoff_xy_tolerance,std::fabs(task_->takeoffZError(i)),config_.takeoff_z_tolerance,
+            std::hypot(i.vx,i.vy),config_.takeoff_stable_xy_speed,std::fabs(i.vz),config_.takeoff_stable_z_speed,
+            std::fabs(i.yaw_rate),config_.takeoff_stable_yaw_rate,task_->takeoffHoldSeconds(i.now),config_.hover_seconds,
+            task_->takeoffFailedGates(i));
+    }
+    if(i.now-last_diagnostic_>=1.0/diagnostic_hz_) {diagnostics(i,out);last_diagnostic_=i.now;}
+}
+void Safina_land::diagnostics(const land_task::Input& i,const land_task::Command& out) {
+    const auto goal=task_->guidanceGoal(i);
+    const bool goal_valid=task_->active()&&out.publish&&out.phase!=land_task::Phase::PRESTREAM&&
+        out.phase!=land_task::Phase::LAND_HANDOFF&&out.phase!=land_task::Phase::AUTO_LAND;
+    std::ostringstream row;row<<std::setprecision(12)<<ros::Time::now().toSec()<<','<<i.now<<','
+        <<land_task::name(out.phase)<<','<<task_->reason()<<','<<task_->active()<<','<<i.mode<<','<<i.armed<<','
+        <<i.x<<','<<i.y<<','<<i.z<<','<<i.yaw<<','<<i.vx<<','<<i.vy<<','<<i.vz<<','<<i.yaw_rate<<','
+        <<task_->targetFresh(i)<<','<<(i.target_time<0?-1:i.now-i.target_time)<<','<<i.target_x<<','<<i.target_y<<','
+        <<task_->targetError(i)<<','<<i.target_yaw<<','<<i.target_distance<<','
+        <<out.desired.x<<','<<out.desired.y<<','<<out.desired.z<<','<<out.desired_yaw_rate<<','
+        <<out.velocity.x<<','<<out.velocity.y<<','<<out.velocity.z<<','<<out.yaw_rate<<','<<out.publish<<','
+        <<out.planned_descent<<','<<out.request_offboard<<','<<out.request_arm<<','<<out.request_land<<','
+        <<(task_->searchStarted()<0?-1:i.now-task_->searchStarted())<<','
+        <<(rc_valid_&&recent(rc_at_,i.now,rc_config_.timeout))<<','<<rc_slot_<<','<<rc_selected_<<','<<rc_gate_.ready()<<','
+        <<task_->takeoffXYError(i)<<','<<task_->takeoffZError(i)<<','<<task_->takeoffFailedGates(i)<<','
+        <<task_->takeoffHoldSeconds(i.now)<<','<<marker_reason_<<','<<marker_source_age_<<','
+        <<marker_pair_dt_<<','<<marker_jump_<<','<<marker_received_<<','<<marker_accepted_<<','
+        <<target_z_<<','<<goal.x<<','<<goal.y<<','<<goal.z<<','<<goal_valid<<','
+        <<(marker_rx_at_<0?-1:i.now-marker_rx_at_)<<','<<gimbal_ready_<<','<<gimbal_status_<<','<<task_->inheritedAge(i.now)<<','<<task_->inheritedTravel(i)<<','<<out.yaw_hold_active<<','<<task_->descentFailedGates(i)<<','<<task_->alignmentHoldSeconds(i.now);
+    if(diagnostic_file_) {diagnostic_file_<<row.str()<<'\n';diagnostic_file_.flush();}
+    else ROS_ERROR_THROTTLE(5,"Landing diagnostics CSV write failed");
+    std_msgs::String status;status.data=row.str();diagnostic_pub_.publish(status);
+    nav_msgs::Path path;path.header.stamp=ros::Time::now();
+    path.header.frame_id=pose_.header.frame_id.empty()?"map":pose_.header.frame_id;
+    geometry_msgs::PoseStamped point;point.header=path.header;point.pose.orientation.w=1;
+    if(task_->targetFresh(i)) {
+        point.pose.position.x=target_x_;point.pose.position.y=target_y_;point.pose.position.z=target_z_;
+        target_pub_.publish(point);
+    }
+    if(goal_valid) {
+        point.pose.position=pose_.pose.position;path.poses.push_back(point);
+        point.pose.position.x=goal.x;point.pose.position.y=goal.y;point.pose.position.z=goal.z;
+        path.poses.push_back(point);goal_pub_.publish(point);
+    }
+    path_pub_.publish(path); // Empty path explicitly invalidates the previous guidance.
+
+}
+
+int main(int argc,char** argv) {
+    ros::init(argc,argv,"Safina_land_test");ros::NodeHandle node;
+    try {Safina_land controller(node);ros::spin();}
+    catch(const std::exception& error){ROS_FATAL("Landing node initialization failed: %s",error.what());return 1;}
+    return 0;
+}

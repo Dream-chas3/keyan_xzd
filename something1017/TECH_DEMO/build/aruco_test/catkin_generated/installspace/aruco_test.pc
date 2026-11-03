@@ -1,0 +1,8 @@
+prefix=/home/orangepi/something1017/TECH_DEMO/install
+
+Name: aruco_test
+Description: Description of aruco_test
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

@@ -1,0 +1,6 @@
+<launch>
+    <!-- 先让云台朝下（默认 pitch=-90） -->
+    <node name="set_gimbal_down" pkg="rtsp_test" type="set_gimbal_down.py" 
+         output="screen" />
+
+</launch>

@@ -1,0 +1,96 @@
+# 航点任务：A -> B -> C -> D -> 回 A 降落
+# frame: x_right_y_forward
+#   x = 右(+)/左(-), y = 前(+)/后(-), z = 上
+# 节点内部会转换为 SLAM 本地系（x前/y左）；上位机也按 x右/y前 显示。
+# 注意：z 不是对地高度。地面时 local_position.z 应接近 0。
+mission:
+  name: abc_photo
+  frame: x_right_y_forward   # x=右(+)/左(-), y=前(+)/后(-), z=上
+  takeoff_z: 1.0              # 绝对本地 z，不是离地高度
+
+  max_speed: 0.5              # 水平最大速度 m/s（代码会限幅）
+  max_z_speed: 0.25           # 垂直最大速度 m/s
+  max_yaw_rate_deg: 25        # 最大偏航角速度 deg/s
+
+  arrival_tolerance: 0.15     # 水平到点半径 m
+  z_tolerance: 0.10           # 高度到点误差 m
+  yaw_tolerance: 0.15         # 航向到点误差 rad（约 8.6 deg）
+  stable_seconds: 0.6         # 到点后连续稳定时间
+  leg_timeout: 30.0           # 单段超时 s
+  mission_timeout: 300.0      # 总任务超时 s
+  pose_timeout: 0.5           # 定位/里程计数据最大允许龄期 s
+
+  align_timeout: 15.0         # 到点后转向超时
+  settle_timeout: 10.0        # 稳定悬停超时
+  photo_timeout: 8.0          # 拍照应答超时（异步，不阻塞 30 Hz 设定点）
+  gimbal_settle: 1.0          # 云台应答后再等多久拍照
+  gimbal_timeout: 8.0         # 云台命令超时
+  photo_required: false       # true = 拍照失败就中止；第一轮建议 false
+  gimbal_required: false      # true = 云台失败就中止
+
+  return_to_start: false       # 最后一个航点后回到起飞点
+  auto_land: true             # 回到起飞点后 AUTO.LAND
+  geofence_radius: 5.0        # 航点离原点最大水平距离 m
+  min_z: 0.2                  # 航点最低本地 z
+  max_z: 3.0                  # 航点最高本地 z
+
+  # 本机 2026-10-27 读到的遥控器映射：
+  #   RC_MAP_FLTMODE=5, COM_FLTMODE4=7(Offboard), COM_FLTMODE6=2(Position)
+  # 先用定点(POSCTL)档，再把 5 通道拨到 Offboard 档(slot 4)触发。
+  rc:
+    channel: 5
+    offboard_slot: 4
+    min: 1000.0
+    trim: 1500.0
+    max: 2000.0
+    deadzone: 10.0
+    reversed: false
+    timeout: 0.5
+    off_hold_seconds: 0.3
+    on_hold_seconds: 0.2
+    ready_mode: POSCTL
+
+  waypoints:
+    # A 点：起飞点附近。若不想把它当成一个停点，可以删掉，直接从 B 开始。
+    - name: A
+      x: 0.0
+      y: 0.0
+      z: 1.0
+      yaw: hold
+      hold: 1.0
+
+    # B 点：向前 1 m，悬停 2 s，云台俯仰 -60 度，拍一张。
+    # 拍照是异步的：主循环继续 30 Hz 发悬停设定点，不会切出 OFFBOARD。
+    - name: B
+      x: 0.0
+      y: 1.0
+      z: 1.0
+      yaw: hold
+      hold: 2.0
+      photo: true
+      gimbal_pitch: -90
+      gimbal_yaw: 0
+
+    # C 点：不拍照，悬停 1 s 后回起飞点。
+    - name: C
+      x: 1.0
+      y: 1.0
+      z: 1.0
+      yaw: hold
+      hold: 1.0
+      
+    # D 点：不拍照，悬停 1 s 后回起飞点。
+    - name: D
+      x: 1.0
+      y: 0.0
+      z: 1.0
+      yaw: hold
+      hold: 1.0
+      
+    # E 点：不拍照，悬停 1 s 后回起飞点。
+    - name: D
+      x: 0.0
+      y: 0.0
+      z: 1.0
+      yaw: hold
+      hold: 1.0

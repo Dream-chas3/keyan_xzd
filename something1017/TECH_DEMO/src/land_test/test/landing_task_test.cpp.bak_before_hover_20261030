@@ -1,0 +1,367 @@
+#include "land_test/landing_task.h"
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
+#include <cassert>
+#include <iostream>
+#include <limits>
+
+using land_task::Phase;
+using land_task::Command;
+
+struct Rig {
+    land_task::Config cfg;
+    land_task::Task task;
+    land_task::Input in;
+    Command previous;
+    double dt=1.0/30.0,ground=0,pad_x=0,pad_y=0,pad_yaw=0;
+    bool marker=true,plant=true;
+    int arms=0,offboards=0,lands=0;double turn_drift=0;
+    explicit Rig(bool automatic=false) : cfg(),task(cfg) {
+        task.cfg.auto_takeoff=automatic;
+        in.now=100;in.state_ok=in.pose_ok=in.velocity_ok=in.extended_ok=in.connected=true;
+        in.mode="POSCTL";in.armed=!automatic;in.landed_state=automatic?1:2;
+        in.z=automatic?0:1.2;in.target_distance=in.z;
+    }
+    void enable() {std::string reason;assert(task.enable(in,reason));}
+    Command step() {
+        in.now+=dt;
+        in.target_valid=marker;
+        if(marker) {
+            in.target_time=in.now;in.target_x=pad_x;in.target_y=pad_y;
+            in.target_yaw=land_task::angle(in.yaw-pad_yaw);
+            in.target_distance=in.z-ground;
+        }
+        auto out=task.step(in);
+        if(out.request_offboard){in.mode="OFFBOARD";++offboards;}
+        if(out.request_arm){in.armed=true;++arms;}
+        if(out.request_land){in.mode="AUTO.LAND";++lands;}
+        if(out.publish) {
+            assert(std::hypot(out.velocity.x,out.velocity.y)<=task.cfg.max_xy_speed+1e-10);
+            assert(std::fabs(out.velocity.z)<=task.cfg.max_z_speed+1e-10);
+            assert(std::fabs(out.yaw_rate)<=task.cfg.max_yaw_rate+1e-10);
+            if(std::hypot(out.velocity.x,out.velocity.y)>0.00501&&std::fabs(out.yaw_rate)>0.00501)
+                assert(std::hypot(out.velocity.x,out.velocity.y)<=task.cfg.yaw_hold_speed+1e-8);
+            if(previous.publish) {
+                assert(std::hypot(out.velocity.x-previous.velocity.x,out.velocity.y-previous.velocity.y)
+                    <=task.cfg.max_xy_accel*dt+1e-9);
+                assert(std::fabs(out.velocity.z-previous.velocity.z)<=task.cfg.max_z_accel*dt+1e-9);
+                assert(std::fabs(out.yaw_rate-previous.yaw_rate)<=task.cfg.max_yaw_accel*dt+1e-9);
+            }
+            if(plant) {
+                in.vx=out.velocity.x;in.vy=out.velocity.y;in.vz=out.velocity.z;in.yaw_rate=out.yaw_rate;
+                if(task.phase()==Phase::ROTATE)in.vy+=turn_drift;
+                in.x+=in.vx*dt;in.y+=in.vy*dt;in.z+=in.vz*dt;in.yaw=land_task::angle(in.yaw+in.yaw_rate*dt);
+                if(in.z-ground>0.1)in.landed_state=2;
+            }
+        }
+        previous=out;return out;
+    }
+    void until(Phase wanted,double timeout=90) {
+        double end=in.now+timeout;
+        while(task.phase()!=wanted&&in.now<end)step();
+        if(task.phase()!=wanted)std::cerr<<"Expected "<<land_task::name(wanted)<<" got "<<land_task::name(task.phase())
+            <<" reason "<<task.reason()<<" z="<<in.z<<" yaw="<<in.yaw<<" xy="<<in.x<<","<<in.y<<"\n";
+        assert(task.phase()==wanted);
+    }
+};
+
+int main() {
+    int checks=0;
+    { // A running node cannot take control until the explicit enable boundary.
+        Rig r;for(int j=0;j<1000;++j){auto c=r.step();assert(!c.publish&&!c.request_offboard&&!c.request_arm&&!c.request_land);}
+        assert(r.task.phase()==Phase::IDLE);++checks;
+    }
+    { // Manual start cannot arm or take off from the ground.
+        Rig r;r.in.armed=false;r.in.landed_state=1;std::string reason;
+        assert(!r.task.enable(r.in,reason));assert(r.task.phase()==Phase::IDLE);++checks;
+    }
+    { // Translation finishes before yaw alignment; neither phase plans descent.
+        Rig r;r.in.x=0.8;r.in.y=-0.3;r.in.yaw=1.1;r.enable();
+        r.until(Phase::TRANSLATE);double start_z=r.in.z;
+        while(r.task.phase()!=Phase::ROTATE){auto c=r.step();assert(!c.planned_descent);assert(std::fabs(c.yaw_rate)<1e-12);}
+        assert(std::hypot(r.in.x,r.in.y)<=r.task.cfg.yaw_start_error+0.01);
+        r.until(Phase::DESCEND);
+        assert(std::fabs(r.in.yaw)<r.task.cfg.yaw_tolerance+0.005);
+        assert(std::fabs(r.in.z-start_z)<0.01);assert(r.arms==0);++checks;
+    }
+    { // A measurement gap brakes descent, holds, and requires a new stable alignment.
+        Rig r;r.in.z=1.8;r.enable();r.until(Phase::DESCEND);for(int n=0;n<25;++n)r.step();
+        const double before=r.in.z;r.marker=false;
+        for(int n=0;n<30;++n){auto c=r.step();assert(!c.planned_descent&&!c.request_land);}
+        assert(r.task.phase()==Phase::LOST_HOLD);assert(std::fabs(r.in.vz)<0.01);
+        assert(before-r.in.z<0.025);r.marker=true;r.step();assert(r.task.phase()==Phase::LOST_HOLD);
+        r.until(Phase::DESCEND);++checks;
+    }
+    { // Increasing horizontal error suspends descent immediately at the policy layer.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.pad_x=0.25;
+        auto c=r.step();assert(!c.planned_descent);assert(r.task.phase()==Phase::STABILIZE);
+        r.until(Phase::TRANSLATE);assert(r.lands==0);++checks;
+    }
+    { // Pilot override is sticky even after OFFBOARD is selected again.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.in.mode="POSCTL";
+        assert(!r.step().publish);assert(r.task.phase()==Phase::CANCELLED);
+        const int requests=r.offboards;r.in.mode="OFFBOARD";
+        for(int j=0;j<200;++j){auto c=r.step();assert(!c.publish&&!c.request_offboard&&!c.request_arm&&!c.request_land);}
+        assert(r.offboards==requests);r.enable();assert(r.task.phase()==Phase::PRESTREAM);++checks;
+    }
+    { // Do not re-arm after a disarm while airborne.
+        Rig r;r.enable();r.until(Phase::TRANSLATE);r.in.armed=false;
+        auto c=r.step();assert(!c.publish&&!c.request_arm);assert(r.task.phase()==Phase::CANCELLED);++checks;
+    }
+    { // The initial no-target clock starts after takeoff and continuous hover.
+        Rig r(true);r.marker=false;r.enable();double enabled=r.in.now;
+        r.until(Phase::ACQUIRE);const double start=r.task.searchStarted();
+        assert(start-enabled>r.task.cfg.takeoff_altitude/r.task.cfg.takeoff_speed+r.task.cfg.hover_seconds);
+        while(r.in.now-start<7.8){r.step();assert(r.lands==0);}
+        r.until(Phase::LAND_HANDOFF);assert(r.in.now-start>=8.0);assert(r.arms==1);
+        r.until(Phase::AUTO_LAND);assert(r.lands==1);++checks;
+    }
+    { // Near-ground loss may hand over to final landing; it never climbs toward hover altitude.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.in.z=0.22;r.step();r.marker=false;
+        auto c=r.step();assert(c.phase==Phase::LAND_HANDOFF);assert(c.desired.z==0);
+        r.until(Phase::AUTO_LAND);assert(r.lands==1);++checks;
+    }
+    { // AUTO.LAND acceptance is not touchdown. Confirm ground + disarm, never re-arm.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.in.z=0.22;
+        r.until(Phase::AUTO_LAND);for(int j=0;j<30;++j)assert(!r.step().publish);
+        assert(r.task.phase()==Phase::AUTO_LAND);r.in.armed=false;r.in.landed_state=1;
+        r.step();assert(r.task.phase()==Phase::COMPLETE);assert(r.arms==0);++checks;
+    }
+    { // An override during stream preparation cancels before any mode retry.
+        Rig r;r.enable();r.in.mode="ALTCTL";auto c=r.step();
+        assert(!c.publish&&!c.request_offboard);assert(r.task.phase()==Phase::CANCELLED);++checks;
+    }
+    { // Fixed wall timer detects stalls and invalid navigation, independently of camera callbacks.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.in.now+=1;
+        assert(!r.step().publish);assert(r.task.phase()==Phase::CANCELLED);
+        Rig bad;bad.enable();bad.in.pose_ok=false;assert(!bad.step().publish);++checks;
+    }
+    { // One frame and intermittent detections do not satisfy stable acquisition/alignment.
+        Rig r;r.enable();r.marker=false;r.until(Phase::ACQUIRE);
+        for(int j=0;j<100;++j){r.marker=j%3==0;r.step();assert(r.task.phase()==Phase::ACQUIRE);}
+        ++checks;
+    }
+    { // Stale valid-flag messages are still rejected; fresh receipt cannot renew old targets.
+        Rig r;r.enable();r.until(Phase::DESCEND);
+        r.marker=false;r.in.target_time=r.in.now-10;r.in.target_valid=true;
+        auto c=r.task.step(r.in);assert(!c.planned_descent);assert(c.phase==Phase::LOST_HOLD);++checks;
+    }
+    { // Invalid parameter combinations fail admission, rather than silently loosening limits.
+        Rig r;r.task.cfg.align_enter_error=r.task.cfg.align_exit_error;std::string reason;
+        assert(!r.task.enable(r.in,reason));
+        r.task.cfg=land_task::Config();r.task.cfg.max_xy_accel=std::numeric_limits<double>::quiet_NaN();
+        assert(!r.task.enable(r.in,reason));++checks;
+    }
+    { // Yaw alignment can be disabled without blocking translation or descent.
+        Rig r;r.task.cfg.align_yaw=false;r.in.yaw=1.5;r.enable();r.until(Phase::DESCEND);
+        assert(std::fabs(r.in.yaw-1.5)<1e-12);++checks;
+    }
+    { // Rotation must brake before drift correction starts; check rate and acceleration bounds.
+        Rig r;r.in.yaw=1.5;r.enable();r.until(Phase::ROTATE);
+        for(int n=0;n<35;++n) { r.step(); }
+        r.pad_x=.3;r.step();
+        r.until(Phase::TRANSLATE);assert(std::fabs(r.in.yaw_rate)<.005);++checks;
+    }
+    { // Nonfinite target values must never create a yaw or descent command.
+        Rig r;r.enable();r.until(Phase::DESCEND);
+        r.in.target_yaw=std::numeric_limits<double>::quiet_NaN();
+        auto c=r.task.step(r.in);assert(!c.planned_descent);assert(c.phase==Phase::LOST_HOLD);++checks;
+    }
+    { // An old near-ground observation cannot authorize blind final landing.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.marker=false;
+        r.in.target_distance=.22;r.in.target_time=r.in.now-2.0;
+        auto c=r.task.step(r.in);assert(c.phase==Phase::LOST_HOLD);assert(!c.request_land);++checks;
+    }
+    { // A missing gimbal acknowledgement cannot start OFFBOARD or arm motors.
+        Rig r(true);r.in.gimbal_ready=false;r.enable();
+        for(int n=0;n<400;++n) {
+            auto c=r.step();assert(!c.publish&&!c.request_arm&&!c.request_offboard&&!c.request_land);
+        }
+        assert(r.task.phase()==Phase::CANCELLED);++checks;
+    }
+    { // Realistic coarse hover may finish takeoff without satisfying precision descent.
+        Rig r(true);r.plant=false;r.enable();r.until(Phase::TAKEOFF);
+        r.in.x=.12;r.in.z=1.2;r.in.vx=.08;r.in.yaw_rate=.08;r.in.landed_state=2;
+        r.until(Phase::ACQUIRE,4.0);
+        for(int n=0;n<180;++n) {auto c=r.step();assert(!c.planned_descent);}
+        assert(r.task.phase()==Phase::TRANSLATE);++checks;
+    }
+    { // Larger drift still prevents takeoff completion; there is no forced visual descent.
+        Rig r(true);r.plant=false;r.enable();r.until(Phase::TAKEOFF);
+        r.in.x=.35;r.in.z=1.2;r.in.landed_state=2;
+        for(int n=0;n<180;++n) {auto c=r.step();assert(!c.planned_descent);}
+        assert(r.task.phase()==Phase::TAKEOFF);assert(r.task.takeoffFailedGates(r.in)&1);++checks;
+    }
+    { // Short gaps inherit the world goal at reduced speed, then resume translation.
+        Rig r;r.in.x=.6;r.enable();r.until(Phase::TRANSLATE);r.step();r.marker=false;
+        for(int j=0;j<5;++j){auto c=r.step();assert(c.phase==Phase::SHORT_LOSS);assert(!c.planned_descent);assert(std::hypot(c.desired.x,c.desired.y)<=.050001);assert(c.desired.z>=0);assert(c.desired_yaw_rate==0);}
+        r.marker=true;r.until(Phase::TRANSLATE,1);++checks;
+    }
+    { // Rotation resumes after a short gap; it is not reset to translation.
+        Rig r;r.in.yaw=1.3;r.enable();r.until(Phase::ROTATE);r.marker=false;
+        for(int j=0;j<4;++j){auto c=r.step();assert(c.phase==Phase::SHORT_LOSS);assert(c.desired_yaw_rate==0);assert(c.desired.x==0&&c.desired.y==0);}
+        r.marker=true;r.until(Phase::ROTATE,1);++checks;
+    }
+    { // Travel and time budgets independently terminate inherited motion.
+        Rig r;r.in.x=.5;r.enable();r.until(Phase::TRANSLATE);r.marker=false;r.step();r.in.x+=.04;
+        auto c=r.step();assert(c.phase==Phase::LOST_HOLD);assert(!c.planned_descent&&!c.request_land);++checks;
+    }
+    { // Reacquired descent must re-enter stabilization and wait again.
+        Rig r;r.in.z=1.8;r.enable();r.until(Phase::DESCEND);r.marker=false;
+        for(int j=0;j<4;++j){auto c=r.step();assert(c.phase==Phase::SHORT_LOSS);assert(!c.planned_descent&&c.desired.z>=0);}
+        r.marker=true;r.until(Phase::STABILIZE,1);double start=r.in.now;
+        r.until(Phase::DESCEND);assert(r.in.now-start>=r.task.cfg.stable_seconds-.04);++checks;
+    }
+    { // Relaxed gates plus periodic 0.2 s dropouts still complete heading alignment.
+        Rig r;r.in.x=.6;r.in.yaw=1.5;r.task.cfg.align_enter_error=.10;r.task.cfg.align_exit_error=.16;
+        r.task.cfg.yaw_start_error=.12;r.task.cfg.yaw_exit_error=.18;
+        r.task.cfg.yaw_tolerance=10*land_task::kPi/180;r.task.cfg.yaw_exit_tolerance=15*land_task::kPi/180;
+        r.task.cfg.stable_seconds=.5;r.task.cfg.stable_xy_speed=.08;r.task.cfg.stable_z_speed=.08;r.task.cfg.stable_yaw_rate=.05;
+        r.enable();int ticks=0;double end=r.in.now+120;
+        while(r.task.phase()!=Phase::DESCEND&&r.in.now<end){r.marker=(ticks++%30)>=6;auto c=r.step();if(!r.marker)assert(!c.planned_descent||c.phase==Phase::TERMINAL_DESCEND);}
+        assert(r.task.phase()==Phase::DESCEND);assert(std::fabs(r.in.yaw)<=r.task.cfg.yaw_tolerance+.01);
+        r.marker=true;r.until(Phase::AUTO_LAND,60);assert(r.lands==1&&r.arms==0);++checks;
+    }
+    { // Near-marker turn actively holds position against 2 cm/s lateral drift.
+        Rig r;r.in.x=.7;r.in.yaw=1.5;r.turn_drift=.02;r.enable();r.until(Phase::ROTATE);
+        bool observed_hold=false;int drift_exits=0;double started=r.in.now;
+        while(r.task.phase()!=Phase::DESCEND&&r.in.now-started<40){
+            auto c=r.step();
+            if(c.yaw_hold_active&&std::fabs(c.desired_yaw_rate)>.005&&std::hypot(c.desired.x,c.desired.y)>.005)observed_hold=true;
+            if(r.task.phase()==Phase::TRANSLATE)++drift_exits;
+            if(c.yaw_hold_active){assert(std::hypot(c.desired.x,c.desired.y)<=r.task.cfg.yaw_hold_speed+1e-9);assert(!c.planned_descent);}
+        }
+        assert(observed_hold&&drift_exits==0&&r.task.phase()==Phase::DESCEND);
+        assert(std::fabs(r.in.yaw)<=r.task.cfg.yaw_tolerance+.01);++checks;
+    }
+    { // Broad horizontal travel still cannot run with a commanded turn.
+        Rig r;r.in.x=1.;r.in.yaw=1.5;r.enable();r.until(Phase::TRANSLATE);
+        for(int j=0;j<20;++j){auto c=r.step();assert(!c.yaw_hold_active);assert(c.desired_yaw_rate==0);}
+        ++checks;
+    }
+    { // Measured-velocity damping reduces the horizontal command at equal error.
+        Rig a;a.task.cfg.xy_kd=0.0;a.enable();a.until(Phase::DESCEND);
+        Rig b;b.task.cfg.xy_kd=0.4;b.enable();b.until(Phase::DESCEND);
+        a.plant=b.plant=false;a.in.x=b.in.x=0.05;a.in.vx=b.in.vx=0.25;
+        auto ca=a.step();auto cb=b.step();
+        assert(std::fabs(cb.desired.x)>std::fabs(ca.desired.x)+0.05);++checks;
+    }
+    { // Close/centered marker commits to terminal descent and ignores target loss.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=0.6;r.in.vz=-0.06;r.in.vx=0;r.in.vy=0;
+        r.until(Phase::TERMINAL_DESCEND,2);
+        const double entry=r.in.z;r.marker=false;
+        for(int j=0;j<90;++j){r.in.z-=r.task.cfg.terminal_descent_speed*r.dt;auto c=r.step();
+            assert(c.phase==Phase::TERMINAL_DESCEND);assert(c.planned_descent);assert(c.desired.z<0);}
+        assert(entry-r.in.z>0.1);
+        r.until(Phase::LAND_HANDOFF,20);++checks;
+    }
+    { // Terminal descent brakes if the aircraft drifts far from the frozen target.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=0.6;r.until(Phase::TERMINAL_DESCEND,2);
+        r.in.x=r.task.cfg.terminal_max_drift+0.1;
+        auto c=r.step();assert(c.phase==Phase::LOST_HOLD);assert(!c.planned_descent);++checks;
+    }
+    { // Marker loss low in DESCEND commits to terminal descent instead of hovering.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=0.8;r.in.vz=-0.06;r.step();r.marker=false;
+        auto c=r.step();assert(c.phase==Phase::TERMINAL_DESCEND);assert(!c.planned_descent);
+        c=r.step();assert(c.phase==Phase::TERMINAL_DESCEND);assert(c.planned_descent);++checks;
+    }
+    { // A marker loss high above the fallback band still holds; no blind descent.
+        Rig r;r.in.z=1.8;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=1.5;r.step();r.marker=false;
+        for(int j=0;j<40;++j){auto c=r.step();assert(c.phase!=Phase::TERMINAL_DESCEND);}
+        assert(r.task.phase()==Phase::LOST_HOLD);++checks;
+    }
+    { // Height trigger: at/below 0.8 m a centered marker commits even when depth is above 0.85.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.ground=-0.30;r.in.z=0.75;   // target_distance=1.05 (>0.85), z<=0.80
+        r.until(Phase::TERMINAL_DESCEND,2);++checks;
+    }
+    { // Above 0.8 m with depth above 0.85 the task keeps normal descent, no terminal commit.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=1.0;
+        for(int j=0;j<20;++j){auto c=r.step();assert(c.phase==Phase::DESCEND);}
+        ++checks;
+    }
+    { // Below the hold height an aligned terminal descent keeps a slow position hold.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=0.6;r.until(Phase::TERMINAL_DESCEND,2);
+        r.in.z=0.34;r.in.x=0.05;r.in.y=0.05;
+        auto c=r.step();
+        assert(c.phase==Phase::TERMINAL_DESCEND);assert(c.planned_descent);
+        assert(r.task.reason()=="terminal_hold_in_place");
+        assert(std::fabs(c.desired.x)<=r.task.cfg.terminal_hold_speed+1e-9);
+        assert(c.desired.x<0);++checks;
+    }
+    { // Below 0.35 m but far from the target: keep correcting, do not freeze yet.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=0.6;r.until(Phase::TERMINAL_DESCEND,2);
+        r.in.z=0.34;r.in.x=0.15;
+        auto c=r.step();
+        assert(c.phase==Phase::TERMINAL_DESCEND);assert(std::fabs(c.desired.x)>0.01);
+        assert(r.task.reason()!="terminal_hold_in_place");++checks;
+    }
+    { // Soft heading correction is bounded and never pauses the descent.
+        Rig r;r.task.cfg.soft_yaw_enabled=true;r.task.cfg.align_yaw=false;
+        r.pad_yaw=-land_task::kPi/6;  // target_yaw = +30 deg
+        r.enable();r.until(Phase::DESCEND);
+        auto c=r.step();
+        assert(c.planned_descent);assert(c.soft_yaw);
+        assert(std::fabs(c.desired_yaw_rate)>0);
+        assert(std::fabs(c.desired_yaw_rate)<=r.task.cfg.soft_yaw_max_rate+1e-9);++checks;
+    }
+    { // 100 deg is folded to 10 deg for the square marker, not chased as 100 deg.
+        Rig r;r.task.cfg.soft_yaw_enabled=true;r.task.cfg.align_yaw=false;
+        r.pad_yaw=-100*land_task::kPi/180;
+        r.enable();r.until(Phase::DESCEND);
+        auto c=r.step();
+        assert(c.soft_yaw);
+        assert(std::fabs(c.desired_yaw_rate+0.3*10*land_task::kPi/180)<1e-6);++checks;
+    }
+    { // A heading error inside the deadband commands no yaw at all.
+        Rig r;r.task.cfg.soft_yaw_enabled=true;r.task.cfg.align_yaw=false;
+        r.pad_yaw=-2*land_task::kPi/180;
+        r.enable();r.until(Phase::DESCEND);
+        auto c=r.step();
+        assert(!c.soft_yaw);assert(std::fabs(c.desired_yaw_rate)<1e-12);++checks;
+    }
+    { // Low local height hands off to AUTO.LAND instead of waiting for the timeout.
+        Rig r;r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.z=0.6;r.until(Phase::TERMINAL_DESCEND,2);
+        r.in.z=0.14;
+        auto c=r.step();assert(c.phase==Phase::LAND_HANDOFF);assert(!c.planned_descent);
+        r.until(Phase::AUTO_LAND,5);assert(r.lands==1);++checks;
+    }
+    { // Top-edge mode: a right-edge alignment (raw 0) is corrected toward +/-90.
+        Rig r;r.task.cfg.soft_yaw_enabled=true;r.task.cfg.soft_yaw_to_top_edge=true;r.task.cfg.align_yaw=false;
+        r.pad_yaw=0;  // target_yaw = 0, i.e. nose parallel to the right edge
+        r.enable();r.until(Phase::DESCEND);
+        auto c=r.step();
+        assert(c.planned_descent);assert(c.soft_yaw);
+        assert(c.desired_yaw_rate>0);
+        assert(std::fabs(c.desired_yaw_rate)<=r.task.cfg.soft_yaw_max_rate+1e-9);++checks;
+    }
+    { // Top-edge mode near the top edge: raw -84 deg means only 6 deg to go.
+        Rig r;r.task.cfg.soft_yaw_enabled=true;r.task.cfg.soft_yaw_to_top_edge=true;r.task.cfg.align_yaw=false;
+        r.pad_yaw=84*land_task::kPi/180;
+        r.enable();r.until(Phase::DESCEND);
+        auto c=r.step();
+        assert(c.soft_yaw);
+        assert(std::fabs(c.desired_yaw_rate+0.3*6*land_task::kPi/180)<1e-6);++checks;
+    }
+    { // Horizontal I term builds but is capped by xy_integral_limit.
+        Rig r;r.task.cfg.xy_ki=1.0;r.task.cfg.xy_integral_limit=0.03;
+        r.enable();r.until(Phase::DESCEND);r.plant=false;
+        r.in.x=0.10;  // P-only command 0.04; I may add up to 0.03
+        double first=0;
+        for(int j=0;j<60;++j){auto c=r.step();if(j==0)first=std::fabs(c.desired.x);}
+        auto c=r.step();
+        assert(c.planned_descent);
+        assert(std::fabs(c.desired.x)>first+0.015);
+        assert(std::fabs(c.desired.x)<=0.04+0.03+1e-6);++checks;
+    }
+    std::cout<<checks<<" landing lifecycle/scenario checks passed (ideal velocity response; no ROS/FCU)\n";
+}

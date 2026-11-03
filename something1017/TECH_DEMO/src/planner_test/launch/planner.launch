@@ -1,0 +1,57 @@
+<launch>
+    <!-- 启动假地图节点 -->
+    <node pkg="planner_test" type="fake_map" name="fake_map" output="screen">
+        <param name="resolution" value="0.1" />
+        <param name="width"      value="200" />
+        <param name="height"     value="200" />
+    </node>
+
+    <!-- 启动 A* 占据栅格规划节点 -->
+    <node pkg="planner_test" type="astar" name="astar" output="screen">
+        <param name="map_topic" value="map" />
+        <param name="frame_id" value="map" />
+        <param name="occupied_threshold" value="50" />
+    </node>
+
+    <!-- 启动 Dijkstra 占据栅格规划节点 -->
+    <node pkg="planner_test" type="dijkstra" name="dijkstra" output="screen">
+        <param name="map_topic" value="map" />
+        <param name="frame_id" value="map" />
+        <param name="occupied_threshold" value="50" />
+    </node>
+    <!-- 启动 rrt 占据栅格规划节点 -->
+    <node pkg="planner_test" type="rrt" name="rrt" output="screen">
+        <param name="map_topic" value="map" />
+        <param name="frame_id" value="map" />
+        <param name="occupied_threshold" value="50" />
+        <param name="max_iterations" value="10000" />   
+        <param name="step_size" value="0.6" />          
+        <param name="goal_tolerance" value="0.5" />     
+    </node>
+    <!-- 启动 rrtstar 占据栅格规划节点 -->
+    <node pkg="planner_test" type="rrt_star" name="rrt_star" output="screen">
+        <param name="map_topic" value="map" />
+        <param name="frame_id" value="map" />
+        <param name="occupied_threshold" value="50" />
+        <param name="max_iterations" value="12000" />   
+        <param name="step_size" value="0.5" />          
+        <param name="goal_tolerance" value="0.6" />     
+        <param name="neighbor_radius" value="1.5" />    
+        <param name="goal_bias" value="0.3" />          
+    </node>
+
+    <!-- 多项式轨迹平滑节点：订阅 /astar_path，发布 /poly_traj_path 和 /poly_traj_marker -->
+    <node pkg="planner_test" type="poly_traj" name="poly_traj" output="screen">
+        <param name="input_path_topic"   value="astar_path" />
+        <param name="output_path_topic"  value="poly_traj_path" />
+        <param name="marker_topic"       value="poly_traj_marker" />
+        <param name="samples_per_segment" value="30" />
+        <param name="downsample_step"     value="5" />  <!-- 可以调成 8,10 更平滑 -->
+    </node>
+
+    <!-- 启动 RViz -->
+    <node pkg="rviz" type="rviz" name="rviz"
+    args="-d $(find planner_test)/rviz/planner.rviz"
+    output="screen" />
+</launch>
+

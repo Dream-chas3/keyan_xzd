@@ -1,0 +1,28 @@
+
+(cl:in-package :asdf)
+
+(defsystem "orbbec_camera-msg"
+  :depends-on (:roslisp-msg-protocol :roslisp-utils :std_msgs-msg
+)
+  :components ((:file "_package")
+    (:file "DepthFilterParam" :depends-on ("_package_DepthFilterParam"))
+    (:file "_package_DepthFilterParam" :depends-on ("_package"))
+    (:file "DepthFilterState" :depends-on ("_package_DepthFilterState"))
+    (:file "_package_DepthFilterState" :depends-on ("_package"))
+    (:file "DepthFiltersStatus" :depends-on ("_package_DepthFiltersStatus"))
+    (:file "_package_DepthFiltersStatus" :depends-on ("_package"))
+    (:file "DeviceInfo" :depends-on ("_package_DeviceInfo"))
+    (:file "_package_DeviceInfo" :depends-on ("_package"))
+    (:file "DeviceStatus" :depends-on ("_package_DeviceStatus"))
+    (:file "_package_DeviceStatus" :depends-on ("_package"))
+    (:file "Extrinsics" :depends-on ("_package_Extrinsics"))
+    (:file "_package_Extrinsics" :depends-on ("_package"))
+    (:file "IMUInfo" :depends-on ("_package_IMUInfo"))
+    (:file "_package_IMUInfo" :depends-on ("_package"))
+    (:file "Metadata" :depends-on ("_package_Metadata"))
+    (:file "_package_Metadata" :depends-on ("_package"))
+    (:file "StreamProfile" :depends-on ("_package_StreamProfile"))
+    (:file "_package_StreamProfile" :depends-on ("_package"))
+    (:file "StreamStatus" :depends-on ("_package_StreamStatus"))
+    (:file "_package_StreamStatus" :depends-on ("_package"))
+  ))

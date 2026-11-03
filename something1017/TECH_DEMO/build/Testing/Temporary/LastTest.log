@@ -1,0 +1,67 @@
+Start testing: Oct 28 11:51 CST
+----------------------------------------------------------
+1/4 Testing: land_motion_limits
+1/4 Test: land_motion_limits
+Command: "/home/orangepi/something1017/TECH_DEMO/devel/lib/land_test/land_motion_limits_test"
+Directory: /home/orangepi/something1017/TECH_DEMO/build/land_test
+"land_motion_limits" start time: Oct 28 11:51 CST
+Output:
+----------------------------------------------------------
+Motion limits and takeoff arrival hold checks passed
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"land_motion_limits" end time: Oct 28 11:51 CST
+"land_motion_limits" time elapsed: 00:00:00
+----------------------------------------------------------
+
+2/4 Testing: land_task
+2/4 Test: land_task
+Command: "/home/orangepi/something1017/TECH_DEMO/devel/lib/land_test/land_task_test"
+Directory: /home/orangepi/something1017/TECH_DEMO/build/land_test
+"land_task" start time: Oct 28 11:51 CST
+Output:
+----------------------------------------------------------
+45 landing lifecycle/scenario checks passed (ideal velocity response; no ROS/FCU)
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"land_task" end time: Oct 28 11:51 CST
+"land_task" time elapsed: 00:00:00
+----------------------------------------------------------
+
+3/4 Testing: land_rc_gate
+3/4 Test: land_rc_gate
+Command: "/home/orangepi/something1017/TECH_DEMO/devel/lib/land_test/land_rc_gate_test"
+Directory: /home/orangepi/something1017/TECH_DEMO/build/land_test
+"land_rc_gate" start time: Oct 28 11:51 CST
+Output:
+----------------------------------------------------------
+RC selector calibration, startup interlock, edge debounce, sticky cancellation and signal-loss checks passed
+<end of output>
+Test time =   0.01 sec
+----------------------------------------------------------
+Test Passed.
+"land_rc_gate" end time: Oct 28 11:51 CST
+"land_rc_gate" time elapsed: 00:00:00
+----------------------------------------------------------
+
+4/4 Testing: land_takeoff_replay
+4/4 Test: land_takeoff_replay
+Command: "/home/orangepi/something1017/TECH_DEMO/devel/lib/land_test/land_takeoff_replay_test" "/home/orangepi/something1017/TECH_DEMO/src/land_test/test/data/takeoff_hover_20261027.csv"
+Directory: /home/orangepi/something1017/TECH_DEMO/build/land_test
+"land_takeoff_replay" start time: Oct 28 11:51 CST
+Output:
+----------------------------------------------------------
+Recorded-flight replay: old gate remains TAKEOFF; new gate reaches TRANSLATE at +14.2 s and commands motion toward the accepted marker. 5 Hz measurements interpolated for offline policy regression only; no aircraft dynamics validation.
+<end of output>
+Test time =   0.02 sec
+----------------------------------------------------------
+Test Passed.
+"land_takeoff_replay" end time: Oct 28 11:51 CST
+"land_takeoff_replay" time elapsed: 00:00:00
+----------------------------------------------------------
+
+End testing: Oct 28 11:51 CST

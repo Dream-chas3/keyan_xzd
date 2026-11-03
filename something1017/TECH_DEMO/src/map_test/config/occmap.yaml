@@ -1,0 +1,18 @@
+point_cloud_topic: /cloud_registered_body
+
+robot_size: [0.25, 0.25, 0.2]
+
+body_to_camera: [1.0,  0.0,  0.0,  0.00,
+                 0.0,  1.0,  0.0,  0.0 ,   
+                 0.0,  0.0,  1.0,  0.1,
+                 0.0,  0.0,  0.0,  1.0]
+
+map_resolution: 0.1
+
+map_size: [20, 20, 5] 
+
+local_update_range: [4, 4, 2]
+
+local_map_size: [4, 4, 2] 
+
+max_height_visualization: 1.5 

@@ -1,0 +1,8 @@
+prefix=/home/orangepi/something1017/TECH_DEMO/devel
+
+Name: offboard_ctl
+Description: Description of offboard_ctl
+Version: 0.0.0
+Cflags: 
+Libs: -L${prefix}/lib 
+Requires: 

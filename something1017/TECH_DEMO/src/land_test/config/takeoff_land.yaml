@@ -1,0 +1,188 @@
+# Metres above the enable-time ground position, used only in auto_takeoff mode.
+takeOff_altitude: 1.5
+
+aruco_landing:
+  # Four-terminal workflow: launch waits, then the transmitter OFFBOARD edge
+  # starts automatic takeoff + alignment + landing. No fifth-terminal service.
+  start_trigger: rc_offboard
+  auto_takeoff: false
+  # Read from this FCU on 2026-10-27: RC_MAP_FLTMODE=5, COM_FLTMODE4=7.
+  # If flight-mode mapping/calibration changes, update these to match it.
+  rc_channel: 5
+  rc_offboard_slot: 4
+  rc_ready_mode: POSCTL             # confirm position mode before allowing a new switch edge
+  rc_min: 1000.0
+  rc_trim: 1500.0
+  rc_max: 2000.0
+  rc_deadzone: 10.0
+  rc_reversed: false
+  rc_timeout: 0.5
+  rc_off_hold_seconds: 0.3
+  rc_on_hold_seconds: 0.2
+  align_yaw: false
+  # Gentle heading correction during descent; never gates descent.
+  soft_yaw_enabled: true
+  soft_yaw_to_top_edge: true   # align the nose with the top/bottom edge pair, not the nearest edge
+  soft_yaw_kp: 0.3
+  soft_yaw_max_rate: 0.06       # rad/s, about 3.4 deg/s
+  soft_yaw_deadband: 0.05         # rad, about 2.9 deg
+  # Start the edge alignment during TRANSLATE/STABILIZE, not only in DESCEND.
+  # The chosen edge direction is latched as a world heading, so the +/-90 deg
+  # fold cannot flip while approaching.
+  soft_yaw_approach: true
+  takeoff_speed: 0.28              # m/s, small increase from 0.25 (+12%)
+  takeoff_kp: 0.8
+  hover_seconds: 2.0
+  # Coarse completion of takeoff; does NOT relax the precision-descent gates.
+  takeoff_xy_tolerance: 0.15       # m from takeoff anchor
+  takeoff_z_tolerance: 0.08        # m from target height
+  takeoff_stable_xy_speed: 0.10    # m/s
+  takeoff_stable_z_speed: 0.10     # m/s
+  takeoff_stable_yaw_rate: 0.10    # rad/s
+  xy_kp: 0.35                      # 2026-10-30 reduced again after the mono8 pipeline changed the loop latency
+  xy_kd: 0.35                     # measured-velocity damping (seconds); 0.20 -> 0.35 to kill the 24 s limit cycle
+  # Below 1.0 m the DESCEND horizontal loop uses a smaller P: the marker is
+  # large, its PnP target is noisier, and the full gain chased it (~0.9 m shake).
+  descend_xy_gain_height: 1.0
+  descend_xy_kp: 0.20
+  xy_ki: 0.02                     # integral gain; 0 disables; start 0.05
+  xy_integral_limit: 0.05         # m/s cap on the I contribution (anti-windup)
+  z_kp: 0.8
+  z_kd: 0.0                       # vertical damping; keep 0 unless vertical oscillates
+  z_ki: 0.0                       # vertical integral gain; 0 disables
+  z_integral_limit: 0.05          # m/s cap on the vertical I contribution
+  yaw_kp: 0.35
+  descent_speed: 0.11             # m/s, first descent (reverted)
+  max_xy_speed: 0.15               # horizontal vector norm, m/s
+  max_z_speed: 0.28                # m/s; guided descent still uses descent_speed=0.08
+  max_yaw_rate: 0.1
+  max_xy_accel: 0.25               # horizontal vector norm, m/s^2
+  max_z_accel: 0.30                # m/s^2, includes braking after target loss
+  max_yaw_accel: 0.12              # rad/s^2
+  yaw_start_error: 0.12
+  yaw_exit_error: 0.18
+  align_enter_error: 0.1
+  align_exit_error: 0.26           # 0.22 -> 0.26: less trigger-happy descent pause
+  yaw_tolerance: 0.174532925
+  yaw_exit_tolerance: 0.261799388
+  stable_seconds: 0.3               # 0.5 -> 0.3: allow the descent a bit sooner
+  stable_xy_speed: 0.10
+  stable_z_speed: 0.08
+  stable_yaw_rate: 0.05
+  target_confirm_seconds: 0.15
+  target_timeout: 0.4
+  initial_target_timeout: 8.0      # AUTO only, starts after takeoff + stable hover
+  final_marker_distance: 0.25     # optical depth below camera, NOT a rangefinder AGL
+  final_confirm_seconds: 0.3
+  near_ground_loss_seconds: 0.6    # only if already descending and last target close/aligned
+  # Terminal sequence: when the marker is large, hover and centre it on the
+  # camera axis; then correct the camera-to-body offset at constant altitude;
+  # then descend blind on the frozen body-centre target. No marker or soft-yaw
+  # input is used after the commit, so the last part is "descend in place".
+  terminal_descent_enabled: true
+  terminal_marker_depth: 0.85      # optical depth trigger (reverted to 0.85), not AGL
+  terminal_height: 0.80            # local Z trigger (reverted to 0.80)
+  terminal_center_error: 0.08      # m, centering gate (reverted to 0.08)
+  terminal_land_height: 0.01       # local Z below which the blind descent hands off to AUTO.LAND
+  terminal_hold_kp: 1.2            # position-hold gain for the offset move and blind descent
+  terminal_hold_kd: 0.35           # keep 0.35: 0.5 made the offset align time out (18:58 flight)
+  terminal_hold_ki: 0.08           # integral term removes the slow ground-effect offset at touchdown
+  terminal_integral_limit: 0.03    # m/s cap on the terminal I contribution
+  terminal_hold_speed: 0.15        # m/s, max hold/correction speed
+  terminal_align_error: 0.05       # m, offset move tolerance (reverted to 0.05)
+  terminal_align_confirm_seconds: 0.2
+  terminal_align_timeout: 6.0      # s, descend anyway if the offset move cannot settle
+  # Freeze the aligned heading at the commit and hold it through the blind
+  # descent; no marker-based yaw is used after the commit.
+  terminal_heading_hold: true
+  terminal_heading_kp: 0.5
+  terminal_heading_max_rate: 0.06  # rad/s
+  terminal_descent_speed: 0.22     # m/s, blind descent faster (0.18 -> 0.22)
+  # No final slow-down: the slow 25 cm kept the aircraft hovering in ground
+  # effect (motors near hover thrust, lateral push). Keep the last descent at
+  # the same (slightly faster) speed instead; the integral hold rejects the bias.
+  terminal_slow_height: 0.10       # local Z below which the (equal) speed applies
+  terminal_slow_speed: 0.22        # m/s, same as terminal_descent_speed (no slow-down)
+  terminal_max_descent: 1.0        # m below the entry height, then AUTO.LAND
+  terminal_timeout: 15.0           # s
+  terminal_max_drift: 0.25         # m from the frozen target before braking to hover
+  terminal_confirm_seconds: 0.2
+  terminal_loss_depth: 1.20        # if the marker vanishes below this depth, commit to the last target
+  terminal_loss_error: 0.15        # m, last horizontal error allowed for that loss fallback
+  prestream_seconds: 1.2
+  takeover_timeout: 10.0
+  handoff_timeout: 10.0
+  retry_seconds: 1.0
+  max_tick_gap: 0.25
+  state_timeout: 1.5
+  pose_timeout: 0.3
+  velocity_timeout: 0.3
+  extended_timeout: 1.5
+  source_stamp_timeout: 0.4
+  pose_image_tolerance: 0.15
+  target_alpha: 0.5
+  # RTSP images carry no capture stamp. Pair the optical pose with the aircraft
+  # pose this many seconds earlier to cancel the v*latency target bias.
+  # Measured on 2026-10-27: ~0.22 s (x) / ~0.39 s (y); start at 0.30 and tune.
+  image_latency_seconds: 0.20
+  max_marker_range: 10.0
+  max_target_jump: 0.5
+  # Camera origin relative to the body origin, forward/left/up, metres.
+  # The approach drives the CAMERA AXIS onto the marker (offset not applied).
+  # This offset is applied only after the close-range hover, as a short
+  # constant-altitude move, so the BODY CENTRE ends up over the marker before
+  # the blind descent. Sign verified against markerCallback math.
+  camera_offset_x: 0.2
+  camera_offset_y: 0.0             # set if the camera is off the centreline
+  camera_offset_z: 0.0             # negative if the gimbal hangs below the body centre
+  command_gimbal_down: true        # only after explicit enable; failure cancels takeover
+  gimbal_ip: "192.168.144.108"
+  gimbal_port: 2332
+  diagnostic_hz: 5.0
+  diagnostic_directory: ""       # default ~/.ros/aruco_landing, CSV per node run
+
+  gimbal_down_on_startup: true
+  short_loss_enabled: true
+  short_loss_seconds: 0.6
+  short_loss_speed: 0.05
+  short_loss_max_travel: 0.03
+  reacquire_seconds: 0.1
+  yaw_hold_speed: 0.06
+  yaw_hold_kp: 0.6
+aruco_marker:
+  # The 3.5 cm ORIGINAL id0 marker is not used on this aircraft: leaving it on
+  # makes DICT_ARUCO_ORIGINAL report false id0 hits from the net/floor, and its
+  # full-resolution search is the most expensive one. Set true only if you
+  # actually place that small marker.
+  original_enabled: false
+  original_id: 0
+  original_size_m: 0.035
+  original_yaw_offset_deg: 0.0
+  five_enabled: true
+  five_id: 231
+  five_size_m: 0.195                # measured effective side reported by user, 2026-10-27
+  five_yaw_offset_deg: 0.0
+  prefer_original: true
+  # Pixel dimensions must match the existing camera calibration.
+  calibrated_width: 1920
+  calibrated_height: 1080
+  require_calibrated_resolution: true
+  # Only the annotated preview is reduced; detection/pose keep full calibrated pixels.
+  preview_width: 960
+  preview_hz: 15.0
+  # Detection consumes mono8 straight from rtsp_test. The annotated preview is
+  # drawn on a separate downscaled colour topic, so the 30 Hz path never does a
+  # full-size BGR conversion or a 6 MB image copy.
+  color_topic: "/rtsp_cam/image_color"
+  preview_color: true
+  # The small ORIGINAL marker needs the wide adaptive window (verified on the
+  # board: 0.75-scale detection loses it below 53). The large 5X5 marker is
+  # detected at every window down to 15; 23 keeps margin and is ~45% cheaper.
+  original_adaptive_max: 53
+  five_adaptive_max: 23
+  full_native_period: 1.0     # full-resolution fallback period, seconds
+  opencv_threads: 2
+  roi_enabled: true
+  full_search_scale: 0.75
+  full_search_period: 0.6
+  roi_margin_px: 120

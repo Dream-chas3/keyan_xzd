@@ -1,0 +1,7 @@
+<launch>
+
+    <rosparam file="$(find land_test)/config/takeoff_land.yaml" command="load" />
+
+    <node pkg="land_test" type="Safina_land_test" name="Safina_land_test" output="screen"/>
+</launch>
+

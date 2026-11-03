@@ -1,0 +1,69 @@
+{
+  "version": "v2.5.9-tracking-i-term",
+  "time": "2026-10-27 17:33 CST",
+  "backup": "/home/orangepi/.ros/backups/land_tune_terminal_20261027_173339/original_land_test.tar.gz",
+  "flight_nodes_started": false,
+  "motors_armed": false,
+  "main_master_touched": false,
+  "files": {
+    "src/land_test/config/takeoff_land.yaml": "67b9ff9d3f386002ba5cab764ff92bb8b81862a2c15faa702eaf9b70fa4c26cb",
+    "src/land_test/include/land_test/landing_task.h": "13da1ce739063ad10643cb02c93e083782182a93edbd05f11854ca24e144a88f",
+    "src/land_test/include/land_test/Safina_land_test.h": "9e831ddbf60e4e3d2079e48de7edd2551e51f9b4ce2867eeef4f8457edb6493f",
+    "src/land_test/src/Safina_land_test.cpp": "2f41a09f9e31337fc7df7e370fd7cd06a87c2354ee53bf89b0328936918bc0cb",
+    "src/land_test/test/landing_task_test.cpp": "137759796f40e3920cac48db2a84458b230e4bbe8bc82088c29f03a1b63f0fbf",
+    "devel/lib/land_test/Safina_land_test": "8c2d98dc5d3dc5aac85cfd68f3888cba365b4945b5b80af8b9748bb86af0ea10",
+    "src/land_test/test/isolated_ros_test.py": "e36e0ee41e3ec42bc6869ca9b899db814fd58b2f278475fe4da1129fdd0b7d22"
+  },
+  "config_changes": {
+    "xy_kp": 0.45,
+    "xy_kd": 0.15,
+    "z_kd": 0.0,
+    "max_xy_speed": 0.15,
+    "target_alpha": 0.7,
+    "align_exit_error": 0.22,
+    "stable_xy_speed": 0.1,
+    "descent_speed": 0.1,
+    "image_latency_seconds": 0.3,
+    "terminal_descent_enabled": true,
+    "terminal_marker_depth": 0.85,
+    "terminal_center_error": 0.08,
+    "terminal_descent_speed": 0.08,
+    "terminal_max_descent": 1.0,
+    "terminal_timeout": 15.0,
+    "terminal_max_drift": 0.25,
+    "terminal_confirm_seconds": 0.2,
+    "camera_offset_x": 0.2,
+    "camera_offset_y": 0.0,
+    "camera_offset_z": 0.0,
+    "terminal_loss_depth": 1.2,
+    "terminal_loss_error": 0.15,
+    "terminal_height": 0.8,
+    "terminal_hold_height": 0.45,
+    "terminal_hold_error": 0.1,
+    "terminal_hold_kp": 1.2,
+    "terminal_hold_speed": 0.15,
+    "soft_yaw_enabled": true,
+    "soft_yaw_kp": 0.3,
+    "soft_yaw_max_rate": 0.06,
+    "soft_yaw_deadband": 0.05,
+    "terminal_land_height": 0.05,
+    "soft_yaw_to_top_edge": true,
+    "xy_ki": 0.05,
+    "xy_integral_limit": 0.05,
+    "z_ki": 0.0,
+    "z_integral_limit": 0.05
+  },
+  "tests": {
+    "ctest": "4/4 passed",
+    "isolated_ros": "passed",
+    "pure_cpp": "45 checks"
+  },
+  "notes": "Landing horizontal loop is now P + velocity D + clamped I (xy_ki=0.05, cap 0.05 m/s). Anti-windup clamp and reset on every phase transition / task enable. Terminal hold keeps its own position-hold law (no I). Restart the node; no motors started.",
+  "fcu_changes": {
+    "MPC_LAND_SPEED": {
+      "before": 0.7,
+      "after": 0.12,
+      "note": "PX4 AUTO.LAND descent speed; persisted in the FCU. Revert with rosservice set 0.7."
+    }
+  }
+}

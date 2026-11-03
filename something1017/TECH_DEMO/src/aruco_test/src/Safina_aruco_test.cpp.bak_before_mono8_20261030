@@ -1,0 +1,189 @@
+#include "aruco_test/Safina_aruco_test.h"
+#include <algorithm>
+#include <stdexcept>
+
+Safina_Aruco::Safina_Aruco(ros::NodeHandle node_aruco) : node_aruco(node_aruco) {
+    ros::NodeHandle p("/aruco_marker");
+    p.param("original_enabled",original_enabled_,original_enabled_);
+    p.param("five_enabled",five_enabled_,five_enabled_);p.param("prefer_original",prefer_original_,prefer_original_);
+    p.param("original_id",original_id_,original_id_);p.param("five_id",five_id_,five_id_);
+    p.param("original_size_m",original_size_,original_size_);p.param("five_size_m",five_size_,five_size_);
+    p.param("original_yaw_offset_deg",original_offset_,original_offset_);
+    p.param("five_yaw_offset_deg",five_offset_,five_offset_);
+    p.param("calibrated_width",calibrated_width_,calibrated_width_);
+    p.param("calibrated_height",calibrated_height_,calibrated_height_);
+    p.param("require_calibrated_resolution",require_resolution_,require_resolution_);
+    dictionary_5=cv::aruco::getPredefinedDictionary(cv::aruco::DICT_5X5_250);
+    dictionary_ori=cv::aruco::getPredefinedDictionary(cv::aruco::DICT_ARUCO_ORIGINAL);
+    if((!original_enabled_&&!five_enabled_)||original_id_<0||original_id_>=dictionary_ori->bytesList.rows||
+       five_id_<0||five_id_>=dictionary_5->bytesList.rows||!std::isfinite(original_size_)||original_size_<=0||
+       !std::isfinite(five_size_)||five_size_<=0||!std::isfinite(original_offset_)||!std::isfinite(five_offset_)||
+       calibrated_width_<=0||calibrated_height_<=0)throw std::runtime_error("Invalid ArUco ID/size/calibration parameters");
+    p.param("preview_width",preview_width_,preview_width_);
+    p.param("preview_hz",preview_hz_,preview_hz_);
+    p.param("opencv_threads",opencv_threads_,opencv_threads_);
+    if(preview_width_<160||!std::isfinite(preview_hz_)||preview_hz_<=0||preview_hz_>30||opencv_threads_<1)
+        throw std::runtime_error("Invalid ArUco preview/threads parameters");
+    cv::setNumThreads(opencv_threads_);
+    p.param("roi_enabled",roi_enabled_,roi_enabled_);
+    p.param("full_search_scale",full_search_scale_,full_search_scale_);
+    p.param("full_search_period",full_search_period_,full_search_period_);
+    p.param("roi_margin_px",roi_margin_,roi_margin_);
+    if(full_search_scale_<0.5||full_search_scale_>1||full_search_period_<0.2||full_search_period_>2||roi_margin_<40)
+        throw std::runtime_error("Invalid detector search configuration");
+    detector_params_=cv::aruco::DetectorParameters::create();
+    detector_params_->adaptiveThreshWinSizeMax=53;
+    detector_params_->cornerRefinementMethod=cv::aruco::CORNER_REFINE_SUBPIX;
+    detector_params_->cornerRefinementWinSize=3;
+    camera_matrix_=(cv::Mat_<double>(3,3)<<2042.0851788597752,0.0,959.0675902004489,
+        0.0,2042.8993693539358,467.50991502443503,0.0,0.0,1.0);
+    dist_coeffs_=(cv::Mat_<double>(1,5)<<-0.4849208954761301,0.3575460777522052,
+        0.0024881576093297698,-0.0002765905391136276,0.0);
+    initializePublishers();initializeSubscribers();
+    ROS_INFO("ArUco configured: ORIGINAL id=%d side=%.4f m, 5X5 id=%d side=%.4f m, calibration=%dx%d",
+        original_id_,original_size_,five_id_,five_size_,calibrated_width_,calibrated_height_);
+}
+void Safina_Aruco::initializeSubscribers() {
+    node_aruco.param<std::string>("img_topic_",img_topic_,"/rtsp_cam/image_raw");
+    sub_img=node_aruco.subscribe(img_topic_,1,&Safina_Aruco::readStream,this,ros::TransportHints().tcpNoDelay());
+}
+void Safina_Aruco::initializePublishers() {
+    pub_aruco_imgresult=node_aruco.advertise<sensor_msgs::Image>("/aruco_imgresult",1);
+    pub_aruco_poseresult=node_aruco.advertise<geometry_msgs::PoseStamped>("/aruco_poseresult",1,false);
+    metrics_pub_=node_aruco.advertise<std_msgs::String>("/aruco_detector/metrics",1);
+    pub_target_id_=node_aruco.advertise<std_msgs::Int32>("/aruco_target_id",1);
+}
+Safina_Aruco::~Safina_Aruco() {}
+inline double Safina_Aruco::calculateRotationAngle(const std::vector<cv::Point2f>& corners) {
+    const auto edge=corners[1]-corners[0];return std::atan2(edge.y,edge.x);
+}
+void Safina_Aruco::readStream(const sensor_msgs::ImageConstPtr& image) {
+    const ros::Time received=ros::Time::now();const double started=ros::WallTime::now().toSec();
+    const bool preview=pub_aruco_imgresult.getNumSubscribers()>0&&started-last_preview_>=1.0/preview_hz_;
+    std::string search_mode="none";std::string reason="no_configured_id";std::ostringstream seen;seen<<'[';bool first=true;
+    geometry_msgs::PoseStamped result;result.header=image->header;
+    if(result.header.stamp.isZero()) {
+        result.header.stamp=received;
+        ROS_WARN_THROTTLE(10,"Image has no capture stamp; stamping detector receipt. RTSP capture latency remains unknown.");
+    }
+    if(result.header.frame_id.empty())result.header.frame_id="gimbal_camera_optical_frame";
+    result.pose.position.z=-1;result.pose.orientation.w=1;
+    std_msgs::Int32 selected;selected.data=-1;cv::Mat img;
+    try {
+        img=cv_bridge::toCvCopy(image,"bgr8")->image;
+        if(require_resolution_&&(img.cols!=calibrated_width_||img.rows!=calibrated_height_)) {
+            reason="resolution_mismatch";
+            ROS_ERROR_THROTTLE(5,"ArUco resolution %dx%d differs from calibration %dx%d; target invalid",
+                img.cols,img.rows,calibrated_width_,calibrated_height_);
+        } else {
+            cv::Mat gray,inverted;cv::cvtColor(img,gray,cv::COLOR_BGR2GRAY);cv::bitwise_not(gray,inverted);
+            std::vector<int> ids[2];std::vector<std::vector<cv::Point2f>> corners[2];
+            auto detect=[&](const cv::Rect& area,double scale,bool enhance) {
+                cv::Mat region=gray(area),work;
+                if(scale<1)cv::resize(region,work,cv::Size(),scale,scale,cv::INTER_AREA);else work=region;
+                if(enhance){cv::Mat equalized;cv::createCLAHE(2.0,cv::Size(8,8))->apply(work,equalized);work=equalized;}
+                cv::Mat inverse;cv::bitwise_not(work,inverse);
+                for(int family=0;family<2;++family) {
+                    ids[family].clear();corners[family].clear();
+                    if((family==0&&!original_enabled_)||(family==1&&!five_enabled_))continue;
+                    cv::aruco::detectMarkers(family==0?work:inverse,family==0?dictionary_ori:dictionary_5,
+                        corners[family],ids[family],detector_params_);
+                    for(auto& box:corners[family])for(auto& point:box) {
+                        point.x=point.x/float(scale)+area.x;point.y=point.y/float(scale)+area.y;
+                    }
+                    // Full-pixel refinement uses the unchanged calibration matrix.
+                    for(size_t k=0;k<ids[family].size();++k) {
+                        if(ids[family][k]!=(family==0?original_id_:five_id_))continue;
+                        auto& points=corners[family][k];bool inside=true;
+                        for(const auto& pt:points)inside=inside&&pt.x>4&&pt.y>4&&pt.x<gray.cols-5&&pt.y<gray.rows-5;
+                        if(inside)cv::cornerSubPix(family==0?gray:inverted,points,cv::Size(3,3),cv::Size(-1,-1),
+                            cv::TermCriteria(cv::TermCriteria::COUNT+cv::TermCriteria::EPS,20,0.02));
+                    }
+                }
+            };
+            auto found=[&] {
+                return std::find(ids[0].begin(),ids[0].end(),original_id_)!=ids[0].end()||
+                       std::find(ids[1].begin(),ids[1].end(),five_id_)!=ids[1].end();
+            };
+            const cv::Rect whole(0,0,gray.cols,gray.rows);
+            const bool tracked=roi_enabled_&&last_seen_>=0&&started-last_seen_<0.8&&tracking_roi_.area()>0;
+            if(tracked&&started-last_full_search_<full_search_period_) {
+                detect(tracking_roi_&whole,1.0,false);search_mode="roi";
+                if(!found()){detect(tracking_roi_&whole,1.0,true);search_mode="roi_clahe";}
+            }
+            if(!found()) {
+                detect(whole,full_search_scale_,false);search_mode="full_scaled";
+                // Periodic full-resolution fallback retains small-marker acquisition.
+                if(!found()&&started-last_native_search_>=full_search_period_){detect(whole,1.0,false);last_native_search_=started;search_mode="full_native";}
+                last_full_search_=started;
+            }
+            int index[2]={-1,-1};
+            for(int family=0;family<2;++family) {
+                const int wanted=family==0?original_id_:five_id_;
+                auto at=std::find(ids[family].begin(),ids[family].end(),wanted);
+                if(at!=ids[family].end())index[family]=std::distance(ids[family].begin(),at);
+                for(int id:ids[family]) {
+                    if(!first)seen<<',';first=false;
+                    seen<<"{\"family\":\""<<(family==0?"ORIGINAL":"5X5_INVERTED")<<"\",\"id\":"<<id<<'}';
+                }
+                if(preview&&!ids[family].empty())cv::aruco::drawDetectedMarkers(img,corners[family],ids[family]);
+            }
+            int family=last_family_;
+            if(family<0||index[family]<0) {
+                const int first=prefer_original_?0:1;
+                family=index[first]>=0?first:(index[1-first]>=0?1-first:-1);
+            }
+            if(family>=0&&last_family_>=0&&family!=last_family_&&started-last_seen_<0.8) {
+                if(pending_family_==family)++pending_count_;else{pending_family_=family;pending_count_=1;}
+                if(pending_count_<2){family=-1;reason="family_switch_confirming";}
+            } else {pending_family_=-1;pending_count_=0;}
+            if(family>=0) {
+                std::vector<std::vector<cv::Point2f>> one{corners[family][index[family]]};
+                std::vector<cv::Vec3d> rvecs,tvecs;
+                cv::aruco::estimatePoseSingleMarkers(one,family==0?original_size_:five_size_,
+                    camera_matrix_,dist_coeffs_,rvecs,tvecs);
+                const auto& v=tvecs.at(0);
+                if(std::isfinite(v[0])&&std::isfinite(v[1])&&std::isfinite(v[2])&&v[2]>0) {
+                    result.pose.position.x=v[0];result.pose.position.y=v[1];result.pose.position.z=v[2];
+                    const double offset=(family==0?original_offset_:five_offset_)*CV_PI/180.0;
+                    const double raw=calculateRotationAngle(one[0])+offset;
+                    tf2::Quaternion q;q.setRPY(0,0,std::atan2(std::sin(raw),std::cos(raw)));
+                    result.pose.orientation=tf2::toMsg(q);selected.data=family==0?original_id_:five_id_;
+                    last_family_=family;last_seen_=started;reason="selected_pose_valid";
+                    cv::Rect box=cv::boundingRect(one[0]);
+                    const int margin=std::max(roi_margin_,int(std::max(box.width,box.height)*0.7));
+                    tracking_roi_=cv::Rect(box.x-margin,box.y-margin,box.width+2*margin,box.height+2*margin)&whole;
+                    ROS_INFO_THROTTLE(1,"ArUco family=%s id=%d x=%.3f y=%.3f depth=%.3f edge_yaw=%.1f deg",
+                        family==0?"ORIGINAL":"5X5",selected.data,v[0],v[1],v[2],raw*180.0/CV_PI);
+                }
+            }
+        }
+    } catch(const std::exception& error) {reason="processing_exception";ROS_ERROR_THROTTLE(2,"ArUco image processing: %s",error.what());}
+    if(selected.data<0&&started-last_seen_>0.8){last_family_=-1;pending_family_=-1;pending_count_=0;tracking_roi_=cv::Rect();}
+    pub_aruco_poseresult.publish(result);pub_target_id_.publish(selected);
+    if(preview&&!img.empty()) {
+        cv::putText(img,selected.data>=0?"SELECTED TARGET: "+std::to_string(selected.data):"NO CONFIGURED TARGET",
+            cv::Point(24,48),cv::FONT_HERSHEY_SIMPLEX,1.1,
+            selected.data>=0?cv::Scalar(0,255,0):cv::Scalar(0,0,255),2);
+        cv::Mat display;
+        const double scale=std::min(1.0,double(preview_width_)/img.cols);
+        cv::resize(img,display,cv::Size(),scale,scale,cv::INTER_AREA);
+        pub_aruco_imgresult.publish(cv_bridge::CvImage(result.header,"bgr8",display).toImageMsg());
+        last_preview_=started;
+    }
+    seen<<']';std::ostringstream metrics;
+    metrics<<"{\"reason\":\""<<reason<<"\",\"selected_id\":"<<selected.data
+        <<",\"detected\":"<<seen.str()<<",\"processing_ms\":"<<(ros::WallTime::now().toSec()-started)*1000
+        <<",\"search_mode\":\""<<search_mode<<"\",\"source_stamp_known\":"<<(!image->header.stamp.isZero()?"true":"false")
+        <<",\"input_age_seconds\":"<<(image->header.stamp.isZero()?-1:(received-image->header.stamp).toSec())
+        <<",\"width\":"<<image->width<<",\"height\":"<<image->height
+        <<",\"original_id\":"<<original_id_<<",\"five_id\":"<<five_id_
+        <<",\"five_size_m\":"<<five_size_<<",\"preview_hz\":"<<preview_hz_<<'}';
+    std_msgs::String report;report.data=metrics.str();metrics_pub_.publish(report);
+}
+int main(int argc,char** argv) {
+    ros::init(argc,argv,"aruco");ros::NodeHandle node;
+    try {Safina_Aruco detector(node);ros::spin();}
+    catch(const std::exception& error){ROS_FATAL("ArUco initialization failed: %s",error.what());return 1;}
+    return 0;
+}

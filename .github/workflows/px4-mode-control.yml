@@ -1,0 +1,49 @@
+name: PX4 mode control
+on:
+  push:
+    paths:
+      - 'something1017/TECH_DEMO/src/offboard_ctl/**'
+      - 'something1017/TECH_DEMO/src/land_test/**'
+      - 'something1017/TECH_DEMO/tests/**'
+      - '.github/workflows/px4-mode-control.yml'
+  pull_request:
+    paths:
+      - 'something1017/TECH_DEMO/src/offboard_ctl/**'
+      - 'something1017/TECH_DEMO/src/land_test/**'
+      - 'something1017/TECH_DEMO/tests/**'
+      - '.github/workflows/px4-mode-control.yml'
+permissions:
+  contents: read
+jobs:
+  noetic:
+    runs-on: ubuntu-latest
+    container: ros:noetic-ros-base-focal
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          lfs: false
+          sparse-checkout: |
+            something1017/TECH_DEMO/src/offboard_ctl
+            something1017/TECH_DEMO/src/land_test
+            something1017/TECH_DEMO/tests
+      - name: Install ROS build dependencies
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends ros-noetic-mavros-msgs ros-noetic-nav-msgs ros-noetic-cv-bridge ros-noetic-tf2-geometry-msgs python3-yaml
+      - name: Build source and run policy tests
+        shell: bash
+        run: |
+          source /opt/ros/noetic/setup.bash
+          mkdir -p /tmp/mode_ws/src
+          ln -s "$GITHUB_WORKSPACE/something1017/TECH_DEMO/src/offboard_ctl" /tmp/mode_ws/src/
+          ln -s "$GITHUB_WORKSPACE/something1017/TECH_DEMO/src/land_test" /tmp/mode_ws/src/
+          cd /tmp/mode_ws
+          catkin_make -DCMAKE_BUILD_TYPE=Release -DCATKIN_ENABLE_TESTING=ON -j2
+          cd build
+          ctest --output-on-failure
+      - name: Test ROS adapters against private mock FCU
+        shell: bash
+        run: |
+          source /tmp/mode_ws/devel/setup.bash
+          python3 "$GITHUB_WORKSPACE/something1017/TECH_DEMO/tests/px4_mode_ros_test.py" /tmp/mode_ws

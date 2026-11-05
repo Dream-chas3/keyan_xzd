@@ -2,23 +2,14 @@
 takeOff_altitude: 1.5
 
 aruco_landing:
-  # Four-terminal workflow: launch waits, then the transmitter OFFBOARD edge
-  # starts automatic takeoff + alignment + landing. No fifth-terminal service.
-  start_trigger: rc_offboard
+  # PX4 is the only authority for transmitter channel mapping and switch direction.
+  # First fly manually in POSCTL, wait for READY, then manually select OFFBOARD.
+  # This node reads /mavros/state.mode; it never decodes RC PWM or requests OFFBOARD.
+  start_trigger: px4_mode
   auto_takeoff: false
-  # Read from this FCU on 2026-10-27: RC_MAP_FLTMODE=5, COM_FLTMODE4=7.
-  # If flight-mode mapping/calibration changes, update these to match it.
-  rc_channel: 5
-  rc_offboard_slot: 4
-  rc_ready_mode: POSCTL             # confirm position mode before allowing a new switch edge
-  rc_min: 1000.0
-  rc_trim: 1500.0
-  rc_max: 2000.0
-  rc_deadzone: 10.0
-  rc_reversed: false
-  rc_timeout: 0.5
-  rc_off_hold_seconds: 0.3
-  rc_on_hold_seconds: 0.2
+  # Debounce only, NOT channel/slot/calibration settings. READY includes prestream.
+  mode_ready_hold_seconds: 1.2
+  mode_offboard_hold_seconds: 0.2
   align_yaw: false
   # Gentle heading correction during descent; never gates descent.
   soft_yaw_enabled: true

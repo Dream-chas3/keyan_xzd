@@ -15,6 +15,10 @@
 
 工程内的相机 SDK、模型权重、运行库及现有 `build`、`devel` 文件一并保留。`backup_manifest.json` 记录原始文件校验值、权限和符号链接，便于核对备份。
 
+2026-11-06 源码更新：`offboard_ctl` 改为人工切入 OFFBOARD 后升高 1 米、悬停 2 秒并降落；
+`land_test` 的默认触发改为读取 PX4 实际模式，移除香橙派上的遥控器通道/档位映射。
+旧 `build`、`devel` 未更新，使用前需重新编译，详见 [模式触发与运行说明](something1017/TECH_DEMO/MODE_CONTROL.md)。
+
 ## 下载
 
 部分大文件使用 **Git LFS**。请先安装 Git LFS，再下载完整工程：

@@ -1,7 +1,7 @@
 #ifndef SAFINA_LAND_TEST_H
 #define SAFINA_LAND_TEST_H
 #include "land_test/landing_task.h"
-#include "land_test/rc_start_gate.h"
+#include "land_test/mode_start_gate.h"
 #include "gcu/gcu_control.h"
 #include <ros/ros.h>
 #include <geometry_msgs/PoseStamped.h>
@@ -11,7 +11,6 @@
 #include <mavros_msgs/PositionTarget.h>
 #include <mavros_msgs/SetMode.h>
 #include <mavros_msgs/CommandBool.h>
-#include <mavros_msgs/RCIn.h>
 #include <std_srvs/SetBool.h>
 #include <std_msgs/String.h>
 #include <nav_msgs/Path.h>
@@ -30,20 +29,17 @@ public:
     ~Safina_land();
 private:
     ros::NodeHandle node_;
-    ros::Subscriber state_sub_,pose_sub_,velocity_sub_,extended_sub_,marker_sub_,rc_sub_;
+    ros::Subscriber state_sub_,pose_sub_,velocity_sub_,extended_sub_,marker_sub_;
     ros::Publisher command_pub_,diagnostic_pub_,header_pub_,goal_pub_,target_pub_,path_pub_;
     ros::ServiceServer enable_service_;
     ros::ServiceClient mode_client_,arm_client_;
     ros::WallTimer timer_;
     land_task::Config config_;
     std::unique_ptr<land_task::Task> task_;
-    land_task::RcConfig rc_config_;
-    land_task::RcStartGate rc_gate_;
-    std::string start_trigger_="service";
-    std::string rc_ready_mode_="POSCTL";
-    bool rc_valid_=false,rc_selected_=false;
-    int rc_slot_=0;
-    double rc_at_=-1;
+    land_task::ModeStartGate mode_gate_;
+    std::string start_trigger_="px4_mode";
+    bool standby_clear_=false;
+    double standby_check_at_=-1,mode_tick_at_=-1;
     std::mutex mutex_;
     std::condition_variable jobs_;
     std::thread worker_;
@@ -84,7 +80,6 @@ private:
     void velocityCallback(const geometry_msgs::TwistStamped::ConstPtr&);
     void markerCallback(const geometry_msgs::PoseStamped::ConstPtr&);
     void extendedCallback(const mavros_msgs::ExtendedState::ConstPtr&);
-    void rcCallback(const mavros_msgs::RCIn::ConstPtr&);
     bool startTask(double now,std::string& reason);
     void queueJob(const std::string&,double now);
     void workerLoop();

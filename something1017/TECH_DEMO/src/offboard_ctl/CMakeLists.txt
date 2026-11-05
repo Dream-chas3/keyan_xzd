@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.0.2)
 project(offboard_ctl)
+set(CMAKE_CXX_STANDARD 14)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+find_package(Threads REQUIRED)
 
 ## Compile as C++11, supported in ROS Kinetic and newer
 # add_compile_options(-std=c++11)
@@ -117,7 +120,7 @@ catkin_package(
 ## Specify additional locations of header files
 ## Your package locations should be listed before other locations
 include_directories(
-# include
+  include
   ${catkin_INCLUDE_DIRS}
 )
 
@@ -151,7 +154,11 @@ include_directories(
 #   ${catkin_LIBRARIES}
 # )
 add_executable(offboard_ctl src/offboard_ctl.cpp)
-target_link_libraries(offboard_ctl ${catkin_LIBRARIES})
+target_link_libraries(offboard_ctl ${catkin_LIBRARIES} ${CMAKE_THREAD_LIBS_INIT})
+if(CATKIN_ENABLE_TESTING)
+  add_executable(offboard_takeoff_demo_test test/takeoff_demo_test.cpp)
+  add_test(NAME offboard_takeoff_demo COMMAND offboard_takeoff_demo_test)
+endif()
 
 #############
 ## Install ##

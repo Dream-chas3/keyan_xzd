@@ -192,34 +192,38 @@ def main():
         assert len(commands)==before and len(requests)==request_count,"Task reclaimed control without re-enable"
         stop(controller);time.sleep(.2)
         assert len(requests)==request_count,"Destructor changed mode"
-        # Default workflow: the transmitter edge starts an autonomous takeoff.
-        rospy.set_param("/aruco_landing/start_trigger","rc_offboard")
+        # PX4 mode authority: even contradictory raw RC values cannot trigger.
+        rospy.set_param("/aruco_landing/start_trigger","px4_mode")
         rospy.set_param("/aruco_landing/auto_takeoff",True)
-        simulated.update(mode="POSCTL",armed=False,z=0.,landed=1,rc=1514)
+        rospy.set_param("/aruco_landing/rc_channel",99)  # Deliberately invalid legacy settings are ignored.
+        rospy.set_param("/aruco_landing/rc_offboard_slot",-7)
+        simulated.update(mode="OFFBOARD",armed=False,z=0.,landed=1,rc=1514)
         before=len(commands);request_count=len(requests);phases.clear()
-        controller=spawn([str(workspace/"devel/lib/land_test/Safina_land_test"),"__name:=Safina_land_test"],"rc_controller")
-        wait_for(lambda:phases,"RC controller failed to start")
+        controller=spawn([str(workspace/"devel/lib/land_test/Safina_land_test"),"__name:=Safina_land_test"],"mode_controller")
+        wait_for(lambda:phases,"PX4 mode controller failed to start")
         time.sleep(1.3)
-        assert len(commands)==before and len(requests)==request_count,"Already-ON switch started motors at startup"
-        response=enable(True);assert not response.success,"Service unexpectedly bypassed RC trigger"
-        simulated["rc"]=2000;time.sleep(.6)
-        simulated["rc"]=1514
-        wait_for(lambda:any(m.velocity.z>.01 for t,m in commands[before:]),"RC edge did not start automatic climb",timeout=10)
-        assert any(r[0]=="arm" and r[1] for r in requests[request_count:]),"Automatic takeoff did not request arming in simulated FCU"
-        # Moving RC out cancels even if the reported mode has not changed yet.
-        simulated["rc"]=2000
-        wait_for(lambda:phases[-1][2]=="CANCELLED","raw RC switch-out did not cancel")
-        time.sleep(.15);simulated["rc"]=1514
+        assert len(commands)==before and len(requests)==request_count,"Already-OFFBOARD startup triggered task"
+        response=enable(True);assert not response.success,"Service bypassed PX4 mode gate"
+        simulated["mode"]="POSCTL";time.sleep(1.7)
+        assert len(commands)>before and len(requests)==request_count,"POSCTL prestream missing or requested flight action"
+        simulated["rc"]=2000;time.sleep(.3);simulated["rc"]=1514;time.sleep(.3)
+        assert len(requests)==request_count,"Raw RC value bypassed PX4 mode authority"
+        before=len(commands);simulated["mode"]="OFFBOARD"
+        wait_for(lambda:any(m.velocity.z>.01 for t,m in commands[before:]),"PX4 OFFBOARD edge did not start automatic climb",timeout=10)
+        assert any(r[0]=="arm" and r[1] for r in requests[request_count:]),"Automatic takeoff did not request arming"
+        assert not any(r[0]=="mode" and r[1]=="OFFBOARD" for r in requests[request_count:]),"Mode gate requested OFFBOARD itself"
+        simulated["mode"]="POSCTL"
+        wait_for(lambda:phases[-1][2]=="CANCELLED","PX4 POSCTL did not cancel")
+        time.sleep(.1);simulated["mode"]="OFFBOARD";time.sleep(.2)
         before=len(commands);request_count=len(requests);time.sleep(.8)
-        assert len(commands)==before and len(requests)==request_count,"Switch bounce relaunched task"
+        assert len(commands)==before and len(requests)==request_count,"Mode bounce relaunched task"
         simulated["mode"]="POSCTL";simulated["armed"]=False
-        simulated["rc"]=2000;time.sleep(.6);simulated["rc"]=1514
-        wait_for(lambda:len(commands)>before,"A new deliberate RC edge could not restart task")
-        wait_for(lambda:any(m.velocity.z>.01 for t,m in commands[before:]),"Second RC start never climbed")
+        time.sleep(1.7);before=len(commands);simulated["mode"]="OFFBOARD"
+        wait_for(lambda:any(m.velocity.z>.01 for t,m in commands[before:]),"Second deliberate mode edge never climbed")
         simulated["mode"]="ALTCTL"
-        wait_for(lambda:phases[-1][2]=="CANCELLED","mode override did not cancel RC task")
+        wait_for(lambda:phases[-1][2]=="CANCELLED","mode override did not cancel task")
         time.sleep(.2);before=len(commands);request_count=len(requests);time.sleep(.7)
-        assert len(commands)==before and len(requests)==request_count,"Mode override was automatically reclaimed"
+        assert len(commands)==before and len(requests)==request_count,"Mode override was reclaimed"
         stop(controller)
         # Vision-loss message must clear stale target coordinates and orientation.
         simulated["frame"]=np.full((1080,1920,3),255,np.uint8)
@@ -244,7 +248,7 @@ def main():
         wait_for(lambda:metrics[-1]["reason"]=="resolution_mismatch","resolution diagnostic missing")
         stop(detector)
         # Startup camera action uses a loopback mock only; FCU remains untouched.
-        simulated.update(mode="POSCTL",armed=False,z=0.,landed=1,rc=2000)
+        simulated.update(mode="OFFBOARD",armed=False,z=0.,landed=1,rc=2000)
         rospy.set_param("/aruco_landing/command_gimbal_down",True)
         rospy.set_param("/aruco_landing/gimbal_down_on_startup",True)
         rospy.set_param("/aruco_landing/gimbal_ip","127.0.0.1")
@@ -277,8 +281,8 @@ def main():
         wait_for(lambda:headers and phases and dict(zip(headers[-1].split(','),phases[-1])).get("gimbal_status")=="startup_down_failed","startup camera failure not diagnosed")
         assert phases[-1][2]=="IDLE" and len(requests)==request_count and len(commands)==command_count
         stop(controller)
-        print("Isolated ROS checks passed: idle side effects=0, service compatibility, RC OFFBOARD edge starts auto takeoff, "
-              "already-ON startup blocked, switch-out cancellation, switch-bounce blocked, deliberate RC re-enable, 30 Hz stream, "
+        print("Isolated ROS checks passed: idle side effects=0, service compatibility, PX4 mode edge starts auto takeoff, "
+              "already-ON startup blocked, mode-exit cancellation, mode-bounce blocked, deliberate mode re-enable, 30 Hz stream, "
               "manual override latch, no destructor mode changes, configurable IDs, invalidation, ID coexistence, resolution guard, "
               "startup camera -90 deg loopback ACK and failure with zero FCU actions")
         print("Private master:",os.environ["ROS_MASTER_URI"],"; logs:",temp.name)

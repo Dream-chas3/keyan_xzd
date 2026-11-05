@@ -33,7 +33,8 @@ bool competingPublisher(std::string& reason) {
     for (int i=0;i<payload[0].size();++i) {
         const std::string topic=payload[0][i][0];
         if (topic!="/mavros/setpoint_raw/local" && topic!="/mavros/setpoint_position/local" &&
-            topic!="/mavros/setpoint_raw/attitude" && topic!="/mavros/setpoint_velocity/cmd_vel") continue;
+            topic!="/mavros/setpoint_raw/attitude" && topic!="/mavros/setpoint_attitude/attitude" &&
+            topic!="/mavros/setpoint_velocity/cmd_vel" && topic!="/mavros/setpoint_velocity/cmd_vel_unstamped") continue;
         for (int j=0;j<payload[0][i][1].size();++j) {
             const std::string publisher=payload[0][i][1][j];
             if (publisher!=ros::this_node::getName()) {
@@ -46,7 +47,7 @@ bool competingPublisher(std::string& reason) {
 }
 
 Safina_land::Safina_land(ros::NodeHandle node) : node_(node) {
-    loadParameters();task_.reset(new land_task::Task(config_));rc_gate_.config=rc_config_;openDiagnostics();
+    loadParameters();task_.reset(new land_task::Task(config_));openDiagnostics();
     command_pub_=node_.advertise<mavros_msgs::PositionTarget>("/mavros/setpoint_raw/local",1);
     diagnostic_pub_=node_.advertise<std_msgs::String>("/aruco_landing/status",1,true);
     header_pub_=node_.advertise<std_msgs::String>("/aruco_landing/status_header",1,true);
@@ -59,7 +60,6 @@ Safina_land::Safina_land(ros::NodeHandle node) : node_(node) {
     velocity_sub_=node_.subscribe("/mavros/local_position/velocity_local",10,&Safina_land::velocityCallback,this);
     extended_sub_=node_.subscribe("/mavros/extended_state",10,&Safina_land::extendedCallback,this);
     marker_sub_=node_.subscribe("/aruco_poseresult",1,&Safina_land::markerCallback,this);
-    rc_sub_=node_.subscribe("/mavros/rc/in",10,&Safina_land::rcCallback,this);
     mode_client_=node_.serviceClient<mavros_msgs::SetMode>("/mavros/set_mode");
     arm_client_=node_.serviceClient<mavros_msgs::CommandBool>("/mavros/cmd/arming");
     enable_service_=node_.advertiseService("/aruco_landing/enable",&Safina_land::enable,this);
@@ -69,8 +69,8 @@ Safina_land::Safina_land(ros::NodeHandle node) : node_(node) {
         job_="gimbal_startup";job_generation_=generation_;pending_=true;gimbal_status_="startup_pending";jobs_.notify_one();
     }
     timer_=node_.createWallTimer(ros::WallDuration(1.0/30.0),&Safina_land::tick,this);
-    ROS_WARN("ArUco landing v2: WAITING. Startup sends no flight setpoints, arming or mode requests. "
-             "Trigger=%s auto_takeoff=%s. Camera startup-down=%s. For RC trigger, first select a non-OFFBOARD position then switch into OFFBOARD. Diagnostics: %s",
+    ROS_WARN("ArUco landing v3: WAITING. No arming or mode requests before trigger. "
+             "Trigger=%s auto_takeoff=%s. Camera startup-down=%s. PX4 mode trigger: wait for READY in POSCTL, then manually switch OFFBOARD. Standby streams zero velocity; PWM mapping is never interpreted here. Diagnostics: %s",
              start_trigger_.c_str(),config_.auto_takeoff?"true":"false",
              (command_gimbal_down_&&gimbal_down_on_startup_)?"true":"false",diagnostic_path_.c_str());
 }
@@ -93,19 +93,17 @@ void Safina_land::loadParameters() {
     node_.param("takeOff_altitude",config_.takeoff_altitude,config_.takeoff_altitude);
     p.param("auto_takeoff",config_.auto_takeoff,config_.auto_takeoff);
     p.param("start_trigger",start_trigger_,start_trigger_);
-    p.param("rc_ready_mode",rc_ready_mode_,rc_ready_mode_);
-    p.param("rc_channel",rc_config_.channel,rc_config_.channel);
-    p.param("rc_offboard_slot",rc_config_.offboard_slot,rc_config_.offboard_slot);
-    p.param("rc_min",rc_config_.minimum,rc_config_.minimum);
-    p.param("rc_trim",rc_config_.trim,rc_config_.trim);
-    p.param("rc_max",rc_config_.maximum,rc_config_.maximum);
-    p.param("rc_deadzone",rc_config_.deadzone,rc_config_.deadzone);
-    p.param("rc_reversed",rc_config_.reversed,rc_config_.reversed);
-    p.param("rc_timeout",rc_config_.timeout,rc_config_.timeout);
-    p.param("rc_off_hold_seconds",rc_config_.off_hold_seconds,rc_config_.off_hold_seconds);
-    p.param("rc_on_hold_seconds",rc_config_.on_hold_seconds,rc_config_.on_hold_seconds);
-    if((start_trigger_!="service"&&start_trigger_!="rc_offboard")||!rc_config_.valid())
-        throw std::runtime_error("Invalid start trigger or RC mode switch calibration");
+    // Accept old launch overrides as an alias, without restoring PWM decoding.
+    if(start_trigger_=="rc_offboard") {
+        ROS_WARN("start_trigger=rc_offboard is deprecated; using PX4-reported mode instead of RC PWM");
+        start_trigger_="px4_mode";
+    }
+    p.param("mode_ready_hold_seconds",mode_gate_.config.ready_hold_seconds,mode_gate_.config.ready_hold_seconds);
+    p.param("mode_offboard_hold_seconds",mode_gate_.config.offboard_hold_seconds,mode_gate_.config.offboard_hold_seconds);
+    if((start_trigger_!="service"&&start_trigger_!="px4_mode")||!mode_gate_.config.valid())
+        throw std::runtime_error("Invalid start trigger or PX4 mode debounce parameters");
+    if(p.hasParam("rc_channel")||p.hasParam("rc_offboard_slot"))
+        ROS_WARN("Legacy rc_channel/rc_offboard_slot parameters are IGNORED: PX4 /mavros/state.mode is authoritative");
     p.param("align_yaw",config_.align_yaw,config_.align_yaw);
     p.param("soft_yaw_enabled",config_.soft_yaw_enabled,config_.soft_yaw_enabled);
     p.param("soft_yaw_to_top_edge",config_.soft_yaw_to_top_edge,config_.soft_yaw_to_top_edge);
@@ -175,6 +173,8 @@ void Safina_land::loadParameters() {
     positive("target_timeout",config_.target_timeout);positive("initial_target_timeout",config_.initial_target_timeout);
     positive("final_marker_distance",config_.final_marker_distance);positive("final_confirm_seconds",config_.final_confirm_seconds);
     positive("near_ground_loss_seconds",config_.near_ground_loss_seconds);positive("prestream_seconds",config_.prestream_seconds);
+    // READY must follow at least a full prestream interval, so PX4 accepts the manual switch.
+    mode_gate_.config.ready_hold_seconds=std::max(mode_gate_.config.ready_hold_seconds,config_.prestream_seconds);
     positive("takeover_timeout",config_.takeover_timeout);positive("handoff_timeout",config_.handoff_timeout);
     positive("retry_seconds",config_.retry_seconds);positive("max_tick_gap",config_.max_tick_gap);
     positive("state_timeout",state_timeout_);positive("pose_timeout",pose_timeout_);
@@ -219,7 +219,7 @@ void Safina_land::openDiagnostics() {
     diagnostic_header_="ros_time,steady_time,phase,reason,enabled,mode,armed,x,y,z,yaw,vx,vy,vz,yaw_rate,"
         "target_valid,target_age,target_x,target_y,xy_error,marker_yaw,marker_depth,desired_vx,desired_vy,"
         "desired_vz,desired_yaw_rate,cmd_vx,cmd_vy,cmd_vz,cmd_yaw_rate,published,planned_descent,"
-        "request_offboard,request_arm,request_land,search_elapsed,rc_valid,rc_slot,rc_offboard_selected,rc_edge_ready,"
+        "request_offboard,request_arm,request_land,search_elapsed,mode_state_fresh,legacy_rc_slot_unused,px4_offboard_selected,mode_edge_ready,"
         "takeoff_xy_error,takeoff_z_error,takeoff_failed_gates,takeoff_hold_seconds,"
         "marker_reason,marker_source_age,marker_pair_dt,marker_jump,marker_received,marker_accepted,"
         "target_z,goal_x,goal_y,goal_z,goal_valid,marker_rx_age,gimbal_ready,gimbal_status,inherit_age,inherit_travel,yaw_hold_active,descent_failed_gates,alignment_hold_seconds";
@@ -253,16 +253,6 @@ void Safina_land::stateCallback(const mavros_msgs::State::ConstPtr& m) {
 }
 void Safina_land::extendedCallback(const mavros_msgs::ExtendedState::ConstPtr& m) {
     std::lock_guard<std::mutex> lock(mutex_);extended_=*m;extended_at_=steady();
-}
-void Safina_land::rcCallback(const mavros_msgs::RCIn::ConstPtr& m) {
-    std::lock_guard<std::mutex> lock(mutex_);rc_at_=steady();
-    const double age=(ros::Time::now()-m->header.stamp).toSec();
-    rc_slot_=m->channels.size()>=size_t(rc_config_.channel)?rc_config_.slot(m->channels[rc_config_.channel-1]):0;
-    rc_valid_=rc_slot_!=0&&m->rssi!=0&&!m->header.stamp.isZero()&&age>=-0.1&&age<=rc_config_.timeout;
-    rc_selected_=rc_slot_==rc_config_.offboard_slot;
-    if(start_trigger_=="rc_offboard"&&task_->active()&&(!rc_valid_||!rc_selected_)){
-        task_->cancel("rc_switch_out_or_invalid");pending_=false;++generation_;
-    }
 }
 void Safina_land::poseCallback(const geometry_msgs::PoseStamped::ConstPtr& m) {
     std::lock_guard<std::mutex> lock(mutex_);const double now=steady();
@@ -344,8 +334,8 @@ void Safina_land::markerCallback(const geometry_msgs::PoseStamped::ConstPtr& m) 
 }
 
 bool Safina_land::enable(std_srvs::SetBool::Request& request,std_srvs::SetBool::Response& response) {
-    if(request.data&&start_trigger_=="rc_offboard") {
-        response.success=false;response.message="RC trigger selected: use the transmitter OFFBOARD switch, no service enable needed";
+    if(request.data&&start_trigger_=="px4_mode") {
+        response.success=false;response.message="PX4 mode trigger selected: wait in POSCTL, then manually switch OFFBOARD; no service enable needed";
         return true;
     }
     if(request.data) {
@@ -384,7 +374,7 @@ void Safina_land::workerLoop() {
         pending_=false;
         // Explicit camera-only startup exception. It cannot call any FCU service,
         // publish flight setpoints, or enable the task. All flight jobs below
-        // retain their original task/RC/state/generation guards.
+        // retain their task/PX4-mode/state/generation guards.
         if(kind=="gimbal_startup") {
             if(!command_gimbal_down_||!gimbal_down_on_startup_)continue;
             worker_busy_=true;gimbal_status_="startup_down_running";lock.unlock();bool ok=false;
@@ -392,12 +382,13 @@ void Safina_land::workerLoop() {
             if(handle){ok=gcu_set_angle(handle,0,-90,0)==0;gcu_disconnect(handle);}
             lock.lock();worker_busy_=false;gimbal_ready_=ok;
             gimbal_status_=ok?"startup_down_acknowledged":"startup_down_failed";
-            ROS_WARN("Camera startup-down acknowledged=%d; landing task remains disabled until RC trigger",ok);
+            ROS_WARN("Camera startup-down acknowledged=%d; landing task remains disabled until PX4 mode trigger",ok);
             continue;
         }
         if(generation!=generation_||!task_->active()||!recent(state_at_,steady(),state_timeout_)||
            !state_.connected||state_.mode!=expected_mode)continue;
-        if(start_trigger_=="rc_offboard"&&(!rc_valid_||!rc_selected_||!recent(rc_at_,steady(),rc_config_.timeout)))continue;
+        if(start_trigger_=="px4_mode"&&state_.mode!="OFFBOARD")continue;
+        if(start_trigger_=="px4_mode"&&kind=="offboard")continue; // Never reclaim a pilot-selected mode.
         if(kind=="offboard"&&task_->phase()!=land_task::Phase::PRESTREAM)continue;
         if(kind=="arm"&&(!config_.auto_takeoff||task_->phase()!=land_task::Phase::PRESTREAM||state_.mode!="OFFBOARD"))continue;
         if(kind=="land"&&task_->phase()!=land_task::Phase::LAND_HANDOFF)continue;
@@ -423,26 +414,42 @@ void Safina_land::workerLoop() {
 }
 
 void Safina_land::tick(const ros::WallTimerEvent&) {
-    std::lock_guard<std::mutex> lock(mutex_);const double now=steady();
-    if(start_trigger_=="rc_offboard") {
-        const bool valid=rc_valid_&&recent(rc_at_,now,rc_config_.timeout);
-        const bool before_ready=rc_gate_.ready();
-        const bool baseline_ok=rc_selected_||task_->active()||
-            (recent(state_at_,now,state_timeout_)&&state_.mode==rc_ready_mode_);
-        const auto event=rc_gate_.update(now,valid&&baseline_ok,rc_selected_,task_->active());
-        if(!before_ready&&rc_gate_.ready())
-            ROS_WARN("RC gate READY in %s: switch to OFFBOARD for %s",rc_ready_mode_.c_str(),
+    std::lock_guard<std::mutex> lock(mutex_);double now=steady();
+    bool standby_publish=false;
+    if(start_trigger_=="px4_mode") {
+        if(!task_->active()&&now-standby_check_at_>=1.0) {
+            std::string reason;standby_clear_=!competingPublisher(reason);standby_check_at_=steady();
+            now=steady();
+            if(!standby_clear_)ROS_WARN_THROTTLE(3,"PX4 mode gate waiting: %s",reason.c_str());
+        }
+        const auto in=input(now);
+        const bool healthy=in.state_ok&&in.connected&&in.pose_ok&&in.velocity_ok&&in.extended_ok;
+        const bool eligible=config_.auto_takeoff?
+            (in.landed_state==1&&(!in.armed||in.mode=="OFFBOARD")):(in.armed&&in.landed_state==2);
+        const bool clear=standby_clear_&&recent(standby_check_at_,now,1.5)&&!pending_&&!worker_busy_;
+        const bool expected_land=(task_->phase()==land_task::Phase::LAND_HANDOFF&&task_->landRequested())||
+            task_->phase()==land_task::Phase::AUTO_LAND;
+        if(mode_tick_at_>=0&&now-mode_tick_at_>config_.max_tick_gap)mode_gate_.reset();
+        mode_tick_at_=now;
+        const bool valid=healthy&&(task_->active()||(eligible&&clear));
+        standby_publish=!task_->active()&&valid&&
+            (in.mode=="POSCTL"||(in.mode=="OFFBOARD"&&mode_gate_.ready()));
+        const bool before_ready=mode_gate_.ready();
+        const auto event=mode_gate_.update(now,valid,in.mode,task_->active(),expected_land);
+        if(!before_ready&&mode_gate_.ready())
+            ROS_WARN("RC gate READY in POSCTL (PX4 mode): manually switch OFFBOARD for %s; no RC channel/slot mapping",
                 config_.auto_takeoff?"autonomous takeoff and landing":"airborne landing takeover");
-        if(event==land_task::RcEvent::CANCEL) {
-            task_->cancel("rc_signal_timeout_or_switch_out");pending_=false;++generation_;
-        } else if(event==land_task::RcEvent::START) {
+        if(event==land_task::ModeEvent::CANCEL) {
+            task_->cancel("px4_mode_exit_or_telemetry_timeout");pending_=false;++generation_;
+        } else if(event==land_task::ModeEvent::START) {
             std::string reason;
             if(competingPublisher(reason)||!startTask(now,reason))
-                ROS_WARN("RC OFFBOARD start rejected: %s; switch out then in to retry",reason.c_str());
+                ROS_WARN("PX4 OFFBOARD start rejected: %s; return to POSCTL, wait READY, then switch in again",reason.c_str());
         }
     }
-    const auto i=input(now);const auto out=task_->step(i);
+    const auto i=input(now);auto out=task_->step(i);
     if(!task_->active())pending_=false;
+    if(!task_->active()&&standby_publish)out.publish=true; // Include standby in published diagnostics.
     if(out.publish) {
         mavros_msgs::PositionTarget cmd;cmd.header.stamp=ros::Time::now();cmd.header.frame_id="map";
         cmd.coordinate_frame=mavros_msgs::PositionTarget::FRAME_LOCAL_NED;
@@ -454,7 +461,7 @@ void Safina_land::tick(const ros::WallTimerEvent&) {
         cmd.velocity.x=out.velocity.x;cmd.velocity.y=out.velocity.y;cmd.velocity.z=out.velocity.z;
         cmd.yaw_rate=out.yaw_rate;command_pub_.publish(cmd);
     }
-    if(out.request_offboard)queueJob("offboard",i.now);
+    if(out.request_offboard&&start_trigger_=="service")queueJob("offboard",i.now);
     if(out.request_arm)queueJob("arm",i.now);
     if(out.request_land)queueJob("land",i.now);
     if(out.phase!=last_phase_) {
@@ -484,7 +491,7 @@ void Safina_land::diagnostics(const land_task::Input& i,const land_task::Command
         <<out.velocity.x<<','<<out.velocity.y<<','<<out.velocity.z<<','<<out.yaw_rate<<','<<out.publish<<','
         <<out.planned_descent<<','<<out.request_offboard<<','<<out.request_arm<<','<<out.request_land<<','
         <<(task_->searchStarted()<0?-1:i.now-task_->searchStarted())<<','
-        <<(rc_valid_&&recent(rc_at_,i.now,rc_config_.timeout))<<','<<rc_slot_<<','<<rc_selected_<<','<<rc_gate_.ready()<<','
+        <<recent(state_at_,i.now,state_timeout_)<<','<<0<<','<<(i.mode=="OFFBOARD")<<','<<mode_gate_.ready()<<','
         <<task_->takeoffXYError(i)<<','<<task_->takeoffZError(i)<<','<<task_->takeoffFailedGates(i)<<','
         <<task_->takeoffHoldSeconds(i.now)<<','<<marker_reason_<<','<<marker_source_age_<<','
         <<marker_pair_dt_<<','<<marker_jump_<<','<<marker_received_<<','<<marker_accepted_<<','
